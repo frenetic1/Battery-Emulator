@@ -1,19 +1,102 @@
 #ifndef TESLA_BATTERY_H
 #define TESLA_BATTERY_H
 #include "../datalayer/datalayer.h"
-#include "CanBattery.h"
 #include "TESLA-HTML.h"
+#include "UdsCanBattery.h"
+
+// HVC backup
+// Reads the HVBMS (0x602/0x612) and HVP (0x610/0x611) fields.
+// Multi-byte fields are big-endian.
+static constexpr uint8_t TESLA_HVC_MAX_MODULES = 8;
+static constexpr uint8_t TESLA_HVC_NUM_HISTOGRAMS = 8;  // HISTOGRAM_ID 1..8
+static constexpr uint8_t TESLA_HVP_NUM_CAL = 8;         // HVP calibration records 0..7
+static constexpr uint8_t TESLA_HVBMS_NUM_CAL = 3;       // HVBMS calibration records 0, 1, 6
+
+// Raw responses collected from the ECUs. The present flags let the JSON emit "MISSING" for
+// anything that NAKed or timed out, like ODIN does.
+struct TeslaHvcBackup {
+  uint8_t energy_counters[32] = {0};  // ENERGY_COUNTERS 0x420
+  bool energy_counters_present = false;
+  // Actual response length. The ODX declares 32, but 2022 packs send 28 with the Ah pair as two
+  // uint16 - the length is what tells the two layouts apart.
+  uint8_t energy_counters_len = 0;
+  uint8_t pack_info[16] = {0};  // PACK_INFO 0x450
+  bool pack_info_present = false;
+  uint8_t hist_page_count[8] = {0};  // HISTOGRAM_PAGE_COUNT 0x436, for the Pack Info block
+  bool hist_page_count_present = false;
+
+  uint8_t assembly_id_hvbms = 0;  // 0xF01C, one byte
+  uint16_t usage_id_hvbms = 0;    // 0xF01D, big-endian uint16 (a one-byte read returns the high half)
+  bool assembly_id_hvbms_present = false, usage_id_hvbms_present = false;
+  uint8_t assembly_id_hvp = 0;
+  uint16_t usage_id_hvp = 0;
+  bool assembly_id_hvp_present = false, usage_id_hvp_present = false;
+
+  char package_pn[24] = {0};  // 0xF014 (ASCII)
+  char package_sn[24] = {0};  // 0xF015
+  char board_pn[24] = {0};    // 0xF012
+  char board_sn[24] = {0};    // 0xF013
+  bool package_pn_present = false, package_sn_present = false, board_pn_present = false,
+       board_sn_present = false;
+
+  uint8_t config_hvbms[64] = {0};  // CONFIGURATION_RECORD 0x439 (HVBMS)
+  uint8_t config_hvbms_len = 0;
+  uint8_t config_hvp[64] = {0};  // CONFIGURATION_RECORD 0x439 (HVP)
+  uint8_t config_hvp_len = 0;
+
+  // HVP calibration records 0..7, each a uint32. ODIN reads these via routine 0x438
+  // CALIBRATION_RECORD getResults, so that is the primary path; from_did marks values that came
+  // from the 0x0500+id DID fallback instead.
+  uint32_t hvp_cal[TESLA_HVP_NUM_CAL] = {0};
+  bool hvp_cal_present[TESLA_HVP_NUM_CAL] = {false};
+  bool hvp_cal_from_did[TESLA_HVP_NUM_CAL] = {false};
+
+  // HVBMS calibration records, ids 0/1/6 per ODIN's required-for-recovery set, via routine 0x439.
+  uint32_t hvbms_cal[TESLA_HVBMS_NUM_CAL] = {0};
+  bool hvbms_cal_present[TESLA_HVBMS_NUM_CAL] = {false};
+
+  uint8_t num_bricks = 0, num_modules = 0;  // from PACK_INFO
+
+  char readable_time[24] = {0};  // "YYYY-MM-DD HH:MM:SS" or "Not Available"
+
+  // Read diagnostics for debugging...
+  static constexpr uint8_t MAX_NRC_RECORDS = 10;
+  uint16_t nrc_did[MAX_NRC_RECORDS] = {0};
+  uint8_t nrc_code[MAX_NRC_RECORDS] = {0};
+  uint8_t nrc_records = 0;
+  uint16_t nrc_count = 0;       // total refusals, including repeats
+  uint16_t short_read_did = 0;  // first response rejected for being shorter than its ODX layout
+  uint8_t short_read_len = 0;
+  uint16_t short_read_count = 0;
+
+  void record_nrc(uint16_t did, uint8_t nrc) {
+    ++nrc_count;
+    for (uint8_t i = 0; i < nrc_records; i++) {
+      if (nrc_did[i] == did && nrc_code[i] == nrc) {
+        return;
+      }
+    }
+    if (nrc_records < MAX_NRC_RECORDS) {
+      nrc_did[nrc_records] = did;
+      nrc_code[nrc_records] = nrc;
+      ++nrc_records;
+    }
+  }
+};
+
+// Render the collected backup as ODIN-format JSON.
+String build_hvc_backup_json(const TeslaHvcBackup& b);
 
 // 0x7FF gateway config, "Gen3" vehicles only, not applicable to Gen2 "classic" Model S and Model X
 // These are user configurable from the Webserver UI
 extern bool user_selected_tesla_digital_HVIL;
-extern uint16_t user_selected_tesla_GTW_country;
-extern bool user_selected_tesla_GTW_rightHandDrive;
-extern uint16_t user_selected_tesla_GTW_mapRegion;
-extern uint16_t user_selected_tesla_GTW_chassisType;
 extern uint16_t user_selected_tesla_GTW_packEnergy;
+extern uint16_t user_selected_tesla_soc_source;
 
-class TeslaBattery : public CanBattery {
+// GTW_carConfig mux3 GTW_packEnergy, VAL_ 2047 GTW_packEnergy 0 "SR" 1 "LR" 2 "MR"
+static constexpr uint16_t TESLA_GTW_PACK_ENERGY_LR = 1;
+
+class TeslaBattery : public UdsCanBattery {
  public:
   bool mandatory_charge_taper() { return true; }
   // Use the default constructor to create the first or single battery.
@@ -23,7 +106,7 @@ class TeslaBattery : public CanBattery {
     previous_max_percentage = datalayer.battery.settings.max_percentage;
   }
   // Use this constructor for the second or third battery.
-  TeslaBattery(DATALAYER_BATTERY_TYPE* datalayer_ptr, CAN_Interface targetCan) : CanBattery(targetCan) {
+  TeslaBattery(DATALAYER_BATTERY_TYPE* datalayer_ptr, CAN_Interface targetCan) : UdsCanBattery(targetCan) {
     datalayer_battery = datalayer_ptr;
     allows_contactor_closing = nullptr;
     previous_max_percentage = datalayer_ptr->settings.max_percentage;
@@ -38,17 +121,266 @@ class TeslaBattery : public CanBattery {
   static constexpr uint8_t BALANCE_STATE_IDLE = 0;
   static constexpr uint8_t BALANCE_STATE_BALANCING = 1;
   static constexpr uint8_t BALANCE_STATE_VSH_TEST = 12;
+
+  //BMS_state (0x212) enum: SUPPORT is the accessory/standalone state that accepts the isolation-monitor disable.
+  static constexpr uint8_t BMS_STATE_SUPPORT = 2;
+
+  enum TeslaUdsState : uint16_t {
+    TESLA_UDS_BMS_RESET = 1,
+    TESLA_UDS_BMS_RESET_ECU,
+    TESLA_UDS_BMS_RESET_DONE,
+    TESLA_UDS_SOC_RESET,
+    TESLA_UDS_SOC_RESET_SESSION,
+    TESLA_UDS_SOC_RESET_KEY,
+    TESLA_UDS_SOC_RESET_ROUTINE,
+    TESLA_UDS_SOC_RESET_RESULT,
+    TESLA_UDS_SOC_RESET_ECU,
+    TESLA_UDS_SOC_RESET_DONE,
+    TESLA_UDS_ISO_CLEAR,
+    TESLA_UDS_ISO_CLEAR_SESSION,
+    TESLA_UDS_ISO_CLEAR_KEY,
+    TESLA_UDS_ISO_CLEAR_COUNTERS,
+    TESLA_UDS_ISO_CLEAR_FLOOD,
+    TESLA_UDS_ISO_CLEAR_INTERNAL,
+    TESLA_UDS_ISO_CLEAR_DONE,
+    //ODIN "Blocked Contactors - Attempt to Clear" (Gen3): VSH latch reset, then the isolation-condition
+    //clear routines, then reset HVBMS, then reset HVP. All HVBMS steps run in one session on 0x602;
+    //the HVP ECUReset is dispatched at the end via pending_ecu_reset_req_id.
+    TESLA_UDS_CBC,           // entry: open extended session
+    TESLA_UDS_CBC_SESSION,   // session ack -> request security seed
+    TESLA_UDS_CBC_KEY,       // seed -> send key, then start VSH latch reset routine
+    TESLA_UDS_CBC_VSH,       // VSH ack -> start isolation-counter reset
+    TESLA_UDS_CBC_COUNTERS,  // -> clear battery coolant flood alert
+    TESLA_UDS_CBC_FLOOD,     // -> clear internal isolation alert
+    TESLA_UDS_CBC_INTERNAL,  // -> ECUReset the HVBMS
+    TESLA_UDS_CBC_HVBMS,     // HVBMS reset ack -> queue the HVP reset, done
+    TESLA_UDS_CBC_DONE,
+    TESLA_UDS_QUERY,
+    TESLA_UDS_QUERY_READ,
+    TESLA_UDS_QUERY_PARSE,
+    TESLA_UDS_BLEED,
+    TESLA_UDS_BLEED_START,
+    TESLA_UDS_BLEED_COUNT,
+    TESLA_UDS_BLEED_RESULT,
+    TESLA_UDS_CAC_RESET,
+    TESLA_UDS_CAC_RESET_ROUTINE,
+    TESLA_UDS_CAC_RESET_RESULT,
+    TESLA_UDS_BRICKV,
+    TESLA_UDS_BRICKV_READ,
+    TESLA_UDS_BRICKV_PARSE,
+    TESLA_UDS_ISO_MON,
+    TESLA_UDS_ISO_MON_SESSION,
+    TESLA_UDS_ISO_MON_KEY,
+    TESLA_UDS_ISO_MON_ROUTINE,
+    TESLA_UDS_ISO_MON_RESULT,
+    // ECU version fingerprint: one sequence walking BMS -> HVP -> PCS, retargeting the UDS channel
+    // between ECUs. A step that times out just moves the chain on (an ECU can be absent).
+    TESLA_UDS_VERSION,          // entry: open extended session on the BMS
+    TESLA_UDS_VERSION_SESSION,  // session ack -> request 0xF180
+    TESLA_UDS_VERSION_F180,     // BMS identity block
+    TESLA_UDS_VERSION_0F00,     // BMS app CRC, then retarget to the HVP
+    TESLA_UDS_VERSION_HVP_F180,
+    TESLA_UDS_VERSION_HVP_0F00,  // then retarget to the PCS
+    TESLA_UDS_VERSION_PCS_F180,
+    TESLA_UDS_VERSION_PCS_0F00,
+    TESLA_UDS_VERSION_PCS_0F02,  // PCS CPU2 CRC
+    TESLA_UDS_VERSION_PCS_F012,  // PCS board part number, then done
+    // Pack identity straight off the HVBMS instead of waiting for the 0x72A broadcast. All DIDs are
+    // security_level 0, so an extended session with no SecurityAccess is enough.
+    // Ends with the PCS board part number; the HVP is not asked - it shares the
+    // HVC board with the HVBMS, so its 0xF012 repeats what the HVBMS already gave.
+    TESLA_UDS_IDENT,           // entry: open extended session
+    TESLA_UDS_IDENT_SESSION,   // session ack -> request 0xF015 PACKAGE_SERIAL_NUMBER
+    TESLA_UDS_IDENT_SERIAL,    // recv 0xF015 -> request 0x0450 PACK_INFO
+    TESLA_UDS_IDENT_PACKINFO,  // recv 0x0450 -> request 0xF014 PACKAGE_PART_NUMBER
+    TESLA_UDS_IDENT_PACK_PN,   // recv 0xF014 -> request 0xF012 BOARD_PART_NUMBER (the HVBMS board)
+    TESLA_UDS_IDENT_BOARD_PN,  // recv 0xF012 -> retarget to the PCS for its board part number
+    TESLA_UDS_IDENT_PCS_PN,    // recv PCS 0xF012 -> done
+    // HVC backup: HVBMS scalar reads, HVBMS calibration records (routine 0x439), then HVP
+    // (retargeted) with HVP calibration via routine 0x438 first and the DID as fallback.
+    // hvc_bk_step indexes the current phase's table.
+    TESLA_UDS_HVC,            // entry
+    TESLA_UDS_HVC_HVBMS,      // response to HVC_SCALARS[hvc_bk_step]
+    TESLA_UDS_HVC_HVBMS_CAL,  // response to HVBMS calibration record HVBMS_CAL_IDS[hvc_bk_step]
+    TESLA_UDS_HVC_HVP,        // response to HVC_SCALARS_HVP[hvc_bk_step] as a DID read
+    TESLA_UDS_HVC_CAL_RT,     // response to routine 0x438 for the current HVP calibration record
+  };
+  static constexpr uint16_t TESLA_MAX_BRICKS = 112;
+  static constexpr unsigned long TESLA_BLEED_POLL_INTERVAL_MS = 30000;
+
+  // HVBMS RoutineControl identifiers (ODJ names).
+  static constexpr uint16_t RID_RESET_SOC = 0x0407;
+  static constexpr uint16_t RID_RESET_CAC = 0x040C;
+  static constexpr uint16_t RID_DISABLE_ISOLATION_MONITOR = 0x040E;
+  static constexpr uint16_t RID_RESET_ISOLATION_COUNTERS = 0x0436;
+  static constexpr uint16_t RID_CLEAR_BATTERY_COOLANT_FLOOD_ALERT = 0x0445;
+  static constexpr uint16_t RID_CLEAR_INTERNAL_ISOLATION_ALERT = 0x0444;
+  static constexpr uint16_t RID_RESET_VSH_FAULT = 0x041C;  //clears BMS_a119_Fast_Open_Vsh_Detected latch
+  // SecurityAccess request-seed sub-functions; sendKey is seed sub-function + 1.
+  static constexpr uint8_t SECURITY_LEVEL_5 = 0x05;
+  static constexpr uint8_t SECURITY_LEVEL_19 = 0x13;
   virtual void transmit_can(unsigned long currentMillis);
 
   bool supports_clear_isolation() { return true; }
   bool supports_insulation_resistance() { return true; }
   void clear_isolation() { datalayer_battery->settings.user_requests_tesla_isolation_clear = true; }
 
+  // The reset commands below require the pack contactors to be OPEN, which the user does manually
+  // before running them - the command is refused if the BMS still reports the contactors closed.
+  const char* contactor_open_warning() {
+    return "This requires the pack contactors to be OPEN. Open them first (switch the car to a mode "
+           "that drops the contactors); the command is refused if they are still closed. Continue?";
+  }
+
   bool supports_reset_BMS() { return true; }
   void reset_BMS() { datalayer_battery->settings.user_requests_tesla_bms_reset = true; }
 
+  bool supports_reset_HVP() { return true; }
+  void reset_HVP() { datalayer_battery->settings.user_requests_tesla_hvp_reset = true; }
+
+  bool supports_clear_blocked_contactors() { return true; }
+  void clear_blocked_contactors() {
+    datalayer_battery->settings.user_requests_tesla_clear_blocked_contactors = true;
+  }
+
+  bool supports_reset_PCS() { return true; }
+  void reset_PCS() { datalayer_battery->settings.user_requests_tesla_pcs_reset = true; }
+
+  // No "Read DTC" / "Erase DTC" buttons for Tesla: the pack ECUs broadcast their faults via the
+  // alert matrix CAN IDs (0x320/0x3A4/0x31E) rather than serving UDS 0x19, and all three answer
+  // 0x14 ClearDiagnosticInformation with NRC 0x11 (alert/fault display is not affected).
+  bool supports_read_DTC() override { return false; }
+  bool supports_reset_DTC() override { return false; }
+
+  bool supports_hvc_backup() { return true; }
+  void request_hvc_backup_partial() { datalayer_battery->settings.user_requests_tesla_hvc_backup_partial = true; }
+
   bool supports_reset_SOC() { return true; }
   void reset_SOC() { datalayer_battery->settings.user_requests_tesla_soc_reset = true; }
+
+  bool supports_reset_CAC() { return true; }
+  void reset_CAC() { datalayer_battery->settings.user_requests_tesla_cac_reset = true; }
+
+  bool supports_disable_isolation_monitor() { return true; }
+  void disable_isolation_monitor() { datalayer_battery->settings.user_requests_tesla_disable_isolation = true; }
+  void enable_isolation_monitor() { datalayer_battery->settings.user_requests_tesla_enable_isolation = true; }
+
+  bool supports_query_ecu_versions() { return true; }
+  void query_ecu_versions() { ecu_version_query_requested = true; }
+
+  bool supports_set_vehicle_mode() { return true; }
+  void set_vehicle_mode_drive() { datalayer_battery->settings.user_requests_tesla_drive_mode = true; }
+  void set_vehicle_mode_accessory() { datalayer_battery->settings.user_requests_tesla_accessory_mode = true; }
+  void toggle_balance_at_rest() { datalayer_battery->settings.user_requests_tesla_toggle_balance_at_rest = true; }
+
+ protected:
+  void on_uds_sequence_step(uint16_t state, uint8_t sid, const uint8_t* data, uint16_t len) override;
+  void on_uds_sequence_timeout(uint16_t state) override;
+
+ private:
+  void start_routine(uint16_t next_state, uint16_t routine_id);
+  void request_bleed_results(uint16_t start_brick);
+  void finalize_bleed_read();
+  uint32_t brick_bleed_time_s[TESLA_MAX_BRICKS] = {0};
+  uint32_t brick_bleed_prev_s[TESLA_MAX_BRICKS] = {0};
+  uint16_t brick_bleed_pack_count = 0;
+  bool brick_bleed_has_prev = false;
+  unsigned long brick_bleed_last_poll = 0;
+  bool isolation_monitor_disable_latched = false;
+  bool isolation_monitor_disabling = false;
+  bool iso_mon_needs_assert = false;
+  bool battery_was_alive = false;
+  bool brickv_requested = false;   // one-shot fast cell populate via UDS DID 0x410 at startup
+  uint8_t brickv_attempts = 0;
+  static constexpr uint8_t TESLA_BRICKV_MAX_ATTEMPTS = 3;
+  static constexpr uint16_t TESLA_BRICKV_COUNT = 108;
+
+  // ---- ECU firmware-version fingerprint: DID 0xF180 identity + 0x0F00/0x0F02 app CRC on
+  // HVBMS/HVP/PCS, read as one framework sequence. The framework talks to one ECU at a time, so
+  // the sequence retargets it (retarget_uds) between the three.
+  static constexpr uint16_t BMS_UDS_REQUEST = 0x602;
+  static constexpr uint16_t BMS_UDS_RESPONSE = 0x612;
+  static constexpr uint16_t HVP_UDS_REQUEST = 0x610;
+  static constexpr uint16_t HVP_UDS_RESPONSE = 0x611;
+  static constexpr uint16_t PCS_UDS_REQUEST = 0x628;
+  static constexpr uint16_t PCS_UDS_RESPONSE = 0x629;
+  static constexpr uint16_t DID_BOOT_SW_ID = 0xF180;  // 19-byte identity block (hwid + boot CRC)
+  static constexpr uint16_t DID_APP_CRC = 0x0F00;     // 4-byte running application CRC (CPU1)
+  static constexpr uint16_t DID_APP_CRC_CPU2 = 0x0F02;
+  static constexpr uint16_t DID_BOARD_PART_NUMBER = 0xF012;  // 20-byte ASCII, ODX security_level 0
+  struct EcuVersion {
+    uint8_t f180[19] = {0};
+    uint8_t f180_len = 0;  // 0 = not read / no response
+    uint8_t crc0f00[4] = {0};
+    bool crc0f00_valid = false;
+    uint8_t crc0f02[4] = {0};  // PCS CPU2 only
+    bool crc0f02_valid = false;
+  };
+  EcuVersion ecu_ver_bms;
+  EcuVersion ecu_ver_hvp;
+  EcuVersion ecu_ver_pcs;
+  bool ecu_version_query_requested = false;
+  // Point the shared UDS channel at another ECU. Only between sequence steps, and always put back
+  // to the BMS when the sequence ends, whichever way it ends.
+  void retarget_uds(uint16_t req_id, uint16_t resp_id) { setup_uds(req_id, resp_id); }
+  void start_ecu_version_query();
+  void start_identity_query();
+  // Pack build date from the year + Julian day embedded in the serial. Called from both places a
+  // serial can arrive (0x72A broadcast, UDS 0xF015) - whichever lands first locks the other out.
+  void derive_manufacture_date_from_serial();
+  // Store a 0x62 response into the right EcuVersion field, send the chain's next read, and stamp
+  // the fingerprint at the end. The timeout path calls ecu_version_continue directly, so an absent
+  // ECU just moves the chain on.
+  void ecu_version_store_did(EcuVersion& ev, const uint8_t* data, uint16_t len);
+  void ecu_version_continue(uint16_t completed_state);
+  bool ecu_ver_send(uint16_t next_state, uint16_t did);
+  void finish_ecu_version_query();
+  //User-requested UDS ECUReset (0x11 0x01) to the HVP (0x610) or PCS (0x628). Queued in
+  //update_values, sent from transmit_can as a raw single frame - the positive response is
+  //suppressed (0x81), so there is nothing to wait for.
+  uint16_t pending_ecu_reset_req_id = 0;
+  void send_ecu_reset(uint16_t req_id);
+
+  // ---- HVC backup engine: a framework sequence of HVBMS scalar reads, then HVP (retargeted). ----
+  enum HvcBackupPhase : uint8_t {
+    HVC_BK_IDLE = 0,
+    HVC_BK_HVBMS,      // HVBMS DID reads (energy, pack info, identity, config)
+    HVC_BK_HVBMS_CAL,  // HVBMS calibration records 0/1/6 via routine 0x439
+    HVC_BK_HVP,        // HVP reads (assembly, usage, config, calibration records)
+  };
+  TeslaHvcBackup* hvc_backup = nullptr;  // heap-allocated on first use, persists for the download
+  bool hvc_backup_ready = false;
+  bool hvc_backup_refused = false;  // last request rejected, for the UI
+  uint16_t hvc_bk_reads_total = 0;  // reads attempted in the current/last run
+  uint16_t hvc_bk_reads_ok = 0;     // of those, how many produced usable data
+  uint8_t hvc_bk_phase = HVC_BK_IDLE;
+  uint8_t hvc_bk_step = 0;     // index into the current phase's scalar table
+  bool hvc_bk_queued = false;  // the TESLA_UDS_HVC sequence has been accepted by the framework
+  uint16_t hvc_bk_runs = 0;    // completed runs; the web UI downloads when it sees this advance
+  // Actual car reads the backup with the car awake. If BE was walking 0x221 down to OFF, hold ACCESSORY
+  // for the run and put the mode back afterwards; the contactors are not touched either way.
+  bool hvc_bk_accessory_held = false;
+  bool hvc_bk_saved_accessory_forced = false;
+  bool hvc_bk_saved_balance_at_rest = false;
+  void release_hvc_backup_hold();
+  bool hvc_send_current();  // request the current step's DID; false if the channel refused
+  // Handle a step's response (data == nullptr for a timeout): store, record NRCs, try the
+  // calibration routine fallback, then advance. hvc_store_scalar returns false for a response
+  // that answered but was unusable (short), so "n of m reads" reflects data actually captured.
+  void hvc_handle_response(uint16_t state, uint8_t sid, const uint8_t* data, uint16_t len);
+  bool hvc_store_scalar(const uint8_t* rx, uint16_t len, bool via_routine);
+  void hvc_score_and_advance(bool stored);  // count the read, move to the next step or finish
+  void finish_hvc_backup();
+
+ public:
+  // Starts the backup read. False if the pack cannot be read right now (not on the bus, emulator
+  // faulted/stopped, or the UDS channel is busy).
+  bool start_hvc_backup();
+  bool hvc_backup_available() { return hvc_backup_ready; }
+  String hvc_backup_json();
+  String hvc_backup_name();
+  String hvc_backup_status_json();
+  void refuse_hvc_backup() { hvc_backup_refused = true; }
 
   bool supports_charged_energy() { return true; }
 
@@ -112,21 +444,35 @@ class TeslaBattery : public CanBattery {
   //UDS session tracker
   //static bool uds_SessionInProgress = false; // Future use
   //0x221 VCFRONT_LVPowerState
-  uint8_t alternateMux = 0;
+  uint8_t alternateMux = 1;
   uint8_t frameCounter_TESLA_221 = 15;  // Start at 15 for Mux 0
   uint8_t vehicleState = 1;             // "OFF": 0, "DRIVE": 1, "ACCESSORY": 2, "GOING_DOWN": 3
+  bool accessory_mode_forced = false;   // vehicleState = ACCESSORY (set by button or auto), otherwise DRIVE
+  bool power_zeroed = false;            // ACCESSORY button zeroes charge/discharge; DRIVE button clears it
+  bool balance_at_rest_enabled = false;  // experimental: auto DRIVE/ACCESSORY by load so the pack can balance at rest
+  unsigned long rest_below_since_ms = 0;
+  static constexpr int32_t TESLA_REST_THRESHOLD_dA = 10;  // 1 A in deci-amps
+  static constexpr unsigned long TESLA_REST_DWELL_MS = 10000;
   static const uint8_t CAR_OFF = 0;
   static const uint8_t CAR_DRIVE = 1;
   static const uint8_t ACCESSORY = 2;
   static const uint8_t GOING_DOWN = 3;
   uint8_t powerDownSeconds = 9;  // Car power down (i.e. contactor open) tracking timer, 3 seconds per sendingState
   //0x2E1 VCFRONT_status, 6 mux tracker
-  uint8_t muxNumber_TESLA_2E1 = 0;
+  uint8_t muxNumber_TESLA_2E1 = 5;
   //0x334 UI
   bool TESLA_334_INITIAL_SENT = false;
+  //Boot frames
+  bool TESLA_313_INITIAL_SENT = false;
+  bool TESLA_39D_INITIAL_SENT = false;
+  bool TESLA_3C2_INITIAL_SENT = false;
   //0x3A1 VCFRONT_vehicleStatus, 15 frame counter (temporary)
   uint8_t frameCounter_TESLA_3A1 = 0;
   bool timeToMux3A1 = true;
+  //Withhold 0x3A1 until the pack advertises drive power >=100kW (raw 7692 at
+  //0.013 kW/bit on 0x252), then stream it continuously.
+  bool tesla_3A1_armed = false;
+  static constexpr uint16_t TESLA_3A1_ARM_DISCHARGE_RAW = 7692;  // ~100 kW
   //0x504 TWC_status
   bool TESLA_504_INITIAL_SENT = false;
   //0x7FF GTW_carConfig, 5 mux tracker
@@ -169,7 +515,8 @@ class TeslaBattery : public CanBattery {
   uint16_t content_118_digital_hvil[16] = {0x6180, 0x6281, 0x6382, 0x6483, 0x6584, 0x6685, 0x6786, 0x6887,
                                            0x6988, 0x6A89, 0x6B8A, 0x6C8B, 0x6D8C, 0x6E8D, 0x6F8E, 0x708F};
 
-  //0x2A8 CMPD_state: "cycle_time" 100ms, different depending on firmware, semi-manual increment for now
+  //0x2A8 EPBL_status: "cycle_time" 100ms. Left electronic park brake; shares the counter(52|4)/
+  //checksum(56|8) layout with its right-hand pair 0x2E8 EPBR_status via generateFrameCounterChecksum.
   CAN_frame TESLA_2A8 = {.FD = false,
                          .ext_ID = false,
                          .DLC = 8,
@@ -196,7 +543,7 @@ class TeslaBattery : public CanBattery {
                                     .ext_ID = false,
                                     .DLC = 8,
                                     .ID = 0x221,
-                                    .data = {0x61, 0x05, 0x55, 0x05, 0x00, 0x00, 0x00, 0xE3}};
+                                    .data = {0x61, 0x05, 0x55, 0x05, 0x00, 0x00, 0xE0, 0x16}};
 
   //0x221 VCFRONT_LVPowerState "Accessory"
   //VCFRONT_vehiclePowerState VEHICLE_POWER_STATE_ACCESSORY (Mux0, Counter 15): "cycle_time" 50ms each mux/LVPowerStateIndex, VCFRONT_LVPowerStateChecksum/VCFRONT_LVPowerStateCounter generated via generateMuxFrameCounterChecksum
@@ -257,6 +604,7 @@ class TeslaBattery : public CanBattery {
                                           .ID = 0x241,
                                           .data = {0x35, 0x34, 0x0C, 0x0F, 0x8F, 0x55, 0x00}};
 
+  //VCFRONT/VC messages the PCS monitors for MIA (PCS_a024). Missing any of these raises the alert.
   //0x2D1 VCFRONT_okToUseHighPower: "cycle_time" 100ms
   static constexpr CAN_frame TESLA_2D1 = {.FD = false, .ext_ID = false, .DLC = 2, .ID = 0x2D1, .data = {0xFF, 0x01}};
 
@@ -296,6 +644,9 @@ class TeslaBattery : public CanBattery {
                                                            .data = {0xFC, 0x1B, 0xD1, 0x99, 0x9A, 0xD8, 0x09, 0x00}};
 
   //0x2E1 VCFRONT_status: "cycle_time" 10ms each mux/statusIndex
+  //Mux 5 (VCFRONT_statusIndex=5) carries VCFRONT_UP_inDriveState at bit 5, which the BMS keys off
+  //(together with 0x221 vehiclePowerState=DRIVE) to raise BMS_powerLimitsState and grant drive power.
+  //Set at transmit time from vehicleState, so it is a mutable member rather than static constexpr.
   static constexpr CAN_frame TESLA_2E1_MUX_5 = {.FD = false,
                                                 .ext_ID = false,
                                                 .DLC = 8,
@@ -309,7 +660,8 @@ class TeslaBattery : public CanBattery {
                                                         .ID = 0x2E1,
                                                         .data = {0x08, 0x21, 0x04, 0x6E, 0xA0, 0x88, 0x06, 0x04}};
 
-  //0x2E8 EPBR_status: "cycle_time" 100ms
+  //0x2E8 EPBR_status: "cycle_time" 100ms. Right electronic park brake; shares the counter(52|4)/
+  //checksum(56|8) layout with its left-hand pair 0x2A8 EPBL_status via generateFrameCounterChecksum.
   CAN_frame TESLA_2E8 = {.FD = false,
                          .ext_ID = false,
                          .DLC = 8,
@@ -328,7 +680,7 @@ class TeslaBattery : public CanBattery {
                          .ext_ID = false,
                          .DLC = 8,
                          .ID = 0x293,
-                         .data = {0x01, 0x0C, 0x55, 0x91, 0x55, 0x15, 0x01, 0xF3}};
+                         .data = {0x01, 0x0C, 0x55, 0x91, 0x55, 0x15, 0x71, 0x63}};
 
   //0x3A1 VCFRONT_vehicleStatus: "cycle_time" 50ms, VCFRONT_vehicleStatusChecksum/VCFRONT_vehicleStatusCounter eventually need to be generated via generateMuxFrameCounterChecksum
   //Looks like 2 muxes, counter at bit 52 width 4 and checksum at bit 56 width 8? Need later software Model3_ETH.compact.json signal file or DBC.
@@ -343,19 +695,30 @@ class TeslaBattery : public CanBattery {
                             0x81, 0x4B, 0xA1, 0x6B, 0xC1, 0x8B, 0xE1, 0xAB};
   //0x313 UI_powertrainControl: "cycle_time" 500ms, UI_powertrainControlChecksum/UI_powertrainControlCounter generated via generateFrameCounterChecksum
   //Ref tesla-m3-pack-findings (fw 2019.20.4.2): CAN 0x313 = UI_trackModeSettings on that firmware; UI_powertrainControl is 0x334 there (name drift)
+  //0x313 UI_powertrainControl (initial frame): counter 4, checksum 0x25
+  static constexpr CAN_frame TESLA_313_INITIAL = {.FD = false,
+                                                  .ext_ID = false,
+                                                  .DLC = 8,
+                                                  .ID = 0x313,
+                                                  .data = {0x02, 0x64, 0x64, 0x05, 0x00, 0x00, 0x40, 0x25}};
+
+  //Seeded to counter 4 so the first regenerate lands on counter 5, continuing the sequence from
+  //TESLA_313_INITIAL. This frame itself is never transmitted - the boot frame goes out in its place -
+  //so its checksum byte is inert.
   CAN_frame TESLA_313 = {.FD = false,
                          .ext_ID = false,
                          .DLC = 8,
                          .ID = 0x313,
-                         .data = {0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x1B}};
+                         .data = {0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x40, 0x5B}};
 
   //0x321 VCFRONT_sensors: "cycle_time" 1000ms
+  //Counter seeded to 5 (byte6 hi-nibble)
   CAN_frame TESLA_321 = {
       .FD = false,
       .ext_ID = false,
       .DLC = 8,
       .ID = 0x321,
-      .data = {0xEC, 0x71, 0xA7, 0x6E, 0x02, 0x6C, 0x00, 0x04}};  // Last 2 bytes are counter and checksum
+      .data = {0xEC, 0x71, 0xA7, 0x6E, 0x02, 0x6C, 0x50, 0x54}};  // Last 2 bytes are counter and checksum
 
   //0x333 UI_chargeRequest: "cycle_time" 500ms, UI_chargeTerminationPct value = 900 [bit 16, width 10, scale 0.1, min 25, max 100]
   //Ref tesla-m3-pack-findings (fw 2019.20.4.2): 0x333 UI_chargeRequest DLC 4 (this frame uses DLC 5; likely firmware drift)
@@ -370,11 +733,12 @@ class TeslaBattery : public CanBattery {
                                                   .data = {0x3F, 0x3F, 0xC8, 0x00, 0xE2, 0x3F, 0x80, 0x1E}};
 
   //0x334 UI request: "cycle_time" 500ms, generated via generateFrameCounterChecksum
+  //Seeded to counter 8, not 9
   CAN_frame TESLA_334 = {.FD = false,
                          .ext_ID = false,
                          .DLC = 8,
                          .ID = 0x334,
-                         .data = {0x3F, 0x3F, 0x00, 0x0F, 0xE2, 0x3F, 0x90, 0x75}};
+                         .data = {0x3F, 0x3F, 0x00, 0x0F, 0xE2, 0x3F, 0x80, 0x65}};
 
   //0x3B3 UI_vehicleControl2: "cycle_time" 500ms
   //Ref tesla-m3-pack-findings (fw 2019.20.4.2): 0x3B3 UI_vehicleControl2 DLC 2 (this frame uses DLC 8; likely firmware drift)
@@ -384,10 +748,15 @@ class TeslaBattery : public CanBattery {
                                           .ID = 0x3B3,
                                           .data = {0x90, 0x80, 0x05, 0x08, 0x00, 0x00, 0x00, 0x01}};
 
-  //0x39D IBST_status: "cycle_time" 50ms, IBST_statusChecksum/IBST_statusCounter generated via generateFrameCounterChecksum
-  CAN_frame TESLA_39D = {.FD = false, .ext_ID = false, .DLC = 5, .ID = 0x39D, .data = {0xE1, 0x59, 0xC1, 0x27, 0x00}};
+  //0x39D IBST_status (initial frame): counter 8, checksum 0x00
+  static constexpr CAN_frame TESLA_39D_INITIAL = {
+      .FD = false, .ext_ID = false, .DLC = 5, .ID = 0x39D, .data = {0x00, 0x58, 0xE1, 0x27, 0x00}};
 
-  //0x3C2 VCLEFT_switchStatus (Mux0, initial frame car sends): "cycle_time" 50ms, sent once
+  //0x39D IBST_status: "cycle_time" 50ms, IBST_statusChecksum/IBST_statusCounter generated via generateFrameCounterChecksum
+  //Seeded to counter 8 so the first regenerate lands on counter 9
+  CAN_frame TESLA_39D = {.FD = false, .ext_ID = false, .DLC = 5, .ID = 0x39D, .data = {0xE0, 0x58, 0xC1, 0x27, 0x00}};
+
+  //0x3C2 VCLEFT_switchStatus (Mux0, initial frame car sends): "cycle_time" 50ms, sent once.
   static constexpr CAN_frame TESLA_3C2_INITIAL = {.FD = false,
                                                   .ext_ID = false,
                                                   .DLC = 8,
@@ -422,26 +791,30 @@ class TeslaBattery : public CanBattery {
                                           .ID = 0x55A,
                                           .data = {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}};
 
-  //0x7FF GTW_carConfig: "cycle_time" 100ms each mux/carConfigMultiplexer (UK/RHD)
-  CAN_frame TESLA_7FF_Mux1 = {.FD = false,
-                              .ext_ID = false,
-                              .DLC = 8,
-                              .ID = 0x7FF,
-                              .data = {0x01, 0x49, 0x42, 0x47, 0x00, 0x03, 0x15, 0x01}};
-
   //0x7FF GTW_carConfig: "cycle_time" 100ms each mux/carConfigMultiplexer
-  static constexpr CAN_frame TESLA_7FF_Mux2 = {.FD = false,
+  //Fixed values now
+  static constexpr CAN_frame TESLA_7FF_Mux1 = {.FD = false,
                                                .ext_ID = false,
                                                .DLC = 8,
                                                .ID = 0x7FF,
-                                               .data = {0x02, 0x66, 0x32, 0x24, 0x04, 0x49, 0x95, 0x82}};
+                                               .data = {0x01, 0x41, 0x41, 0x43, 0x00, 0x03, 0x15, 0x01}};
 
-  //0x7FF GTW_carConfig: "cycle_time" 100ms each mux/carConfigMultiplexer (EU/Long Range)
+  //0x7FF GTW_carConfig: "cycle_time" 100ms each mux/carConfigMultiplexer
+  //Not constexpr: GTW_numberHVILNodes (bit 62, width 2) is written from selected pack in setup()
+  CAN_frame TESLA_7FF_Mux2 = {.FD = false,
+                              .ext_ID = false,
+                              .DLC = 8,
+                              .ID = 0x7FF,
+                              .data = {0x02, 0x66, 0x32, 0x24, 0x04, 0x49, 0x95, 0x82}};
+
+  //0x7FF GTW_carConfig: "cycle_time" 100ms each mux/carConfigMultiplexer
+  //mapRegion US (bits 8-11) fixed.
+  //chassisType (bit 18, width 3) and packEnergy (bit 32, width 5) are written in setup()
   CAN_frame TESLA_7FF_Mux3 = {.FD = false,
                               .ext_ID = false,
                               .DLC = 8,
                               .ID = 0x7FF,
-                              .data = {0x03, 0x01, 0x08, 0x48, 0x01, 0x00, 0x00, 0x12}};
+                              .data = {0x03, 0x00, 0x08, 0x48, 0x01, 0x00, 0x00, 0x12}};
 
   //0x7FF GTW_carConfig: "cycle_time" 100ms each mux/carConfigMultiplexer
   static constexpr CAN_frame TESLA_7FF_Mux4 = {.FD = false,
@@ -485,21 +858,6 @@ class TeslaBattery : public CanBattery {
                                           .ID = 0x25D,
                                           .data = {0x37, 0x41, 0x01, 0x16, 0x08, 0x00, 0x00, 0x00}};
 
-  //0x602 BMS UDS diagnostic request: on demand
-  CAN_frame TESLA_602 = {.FD = false,
-                         .ext_ID = false,
-                         .DLC = 8,
-                         .ID = 0x602,
-                         .data = {0x02, 0x27, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00}};  // Define initial UDS request
-
-  //0x610 BMS Query UDS request: on demand
-  //Ref tesla-m3-pack-findings (fw 2019.20.4.2): CAN 0x610 = UDS_hvpRequest (HVP). On that firmware the BMS/HVBMS UDS request is 0x602 (UDS_bmsRequest) -> response 0x612. Verify addressing against target firmware.
-  static constexpr CAN_frame TESLA_610 = {
-      .FD = false,
-      .ext_ID = false,
-      .DLC = 8,
-      .ID = 0x610,
-      .data = {0x02, 0x10, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00}};  // Define initial UDS request
   //1CF needed for Digital HVIL option
   CAN_frame TESLA_1CF_digital_hvil = {.FD = false,
                                       .ext_ID = false,
@@ -510,10 +868,6 @@ class TeslaBattery : public CanBattery {
   uint8_t index_1CF = 0;
   uint8_t index_118 = 0;
   uint8_t contactor_counter = 0;
-  uint8_t stateMachineClearIsolationFault = 0xFF;
-  uint8_t stateMachineBMSReset = 0xFF;
-  uint8_t stateMachineSOCReset = 0xFF;
-  uint8_t stateMachineBMSQuery = 0xFF;
   uint16_t battery_cell_max_v = 3300;
   uint16_t battery_cell_min_v = 3300;
   bool cellvoltagesRead = false;
@@ -524,6 +878,7 @@ class TeslaBattery : public CanBattery {
   bool BMS_balanceStateUnknown = false;
   uint16_t BMS_balanceTimeThisCycle_s = 0;
   uint32_t BMS_cumulativeBleedTime_s = 0;
+  uint8_t BMS_cacEstimationSource = 0;
   //0x3d2: 978 BMS_kwhCounter
   uint32_t battery_total_discharge = 0;
   uint32_t battery_total_charge = 0;
@@ -546,7 +901,6 @@ class TeslaBattery : public CanBattery {
   //0x132 306 HVBattAmpVolt
   uint16_t battery_volts = 0;                  // V
   int16_t battery_amps = 0;                    // A
-  int16_t battery_raw_amps = 0;                // A
   uint16_t battery_charge_time_remaining = 0;  // Minutes
   //0x252 594 BMS_powerAvailable
   uint16_t BMS_maxRegenPower = 0;           //rename from battery_regenerative_limit
@@ -572,6 +926,8 @@ class TeslaBattery : public CanBattery {
   uint16_t battery_soc_ui = 0;  //Change name from battery_soc_vi to reflect DBC battery_soc_ui
   uint16_t battery_soc_ave = 0;
   uint8_t battery_battTempPct = 0;
+  //0x352 mux2: BMS_userFacingSoe 52|11@1+ (0.05,0) "%" - only transmitted by 2024.20+ pack firmware, 2047 = SNA
+  uint16_t battery_userFacingSoe = 0;
   //0x392: BMS_packConfig
   uint32_t battery_packMass = 0;
   uint32_t battery_platformMaxBusVoltage = 0;
@@ -613,16 +969,24 @@ class TeslaBattery : public CanBattery {
   uint8_t battery_fcCtrsRequestStatus = 0;
   bool battery_fcCtrsResetRequestRequired = false;  // Change to bool
   bool battery_fcLinkAllowedToEnergize = false;     // Change to bool
-                                                    //0x72A: BMS_serialNumber
+                                                    //0x72A: BMS_serialNumber, or UDS 0xF015
   uint8_t battery_serialNumber[14] = {0};           // Stores raw HEX values for ASCII chars
   bool parsed_battery_serialNumber = false;
-  char* battery_manufactureDate;         // YYYY-MM-DD\0
-                                         //Via UDS
+  //Derived from the serial number by derive_manufacture_date_from_serial(), which points this at a
+  //static buffer. Must stay initialised: update_values() copies it into the datalayer for the web UI,
+  //which would otherwise strlen() an indeterminate pointer and panic the board.
+  char* battery_manufactureDate = nullptr;  // YYYY-MM-DD\0
+                                         //Via UDS 0xF014
   uint8_t battery_partNumber[12] = {0};  //stores raw HEX values for ASCII chars
   bool parsed_battery_partNumber = false;
-  //Via UDS
-  //static uint8_t BMS_partNumber[12] = {0};  //stores raw HEX values for ASCII chars
-  //static bool parsed_BMS_partNumber = false;
+  //Via UDS 0xF012 on the HVBMS - the BMS board itself, not the pack package part number
+  uint8_t BMS_partNumber[12] = {0};  //stores raw HEX values for ASCII chars
+  bool parsed_BMS_partNumber = false;
+  // Startup identity pass: one shot per boot, bounded retry while the BMS is not yet answering.
+  bool ident_requested = false;
+  uint8_t ident_attempts = 0;
+  bool identity_from_uds = false;  // serial came from 0xF015 rather than the 0x72A broadcast
+  static constexpr uint8_t TESLA_IDENT_MAX_ATTEMPTS = 3;
   //0x300: BMS_info
   uint16_t BMS_info_buildConfigId = 0;
   uint16_t BMS_info_hardwareId = 0;
@@ -686,7 +1050,7 @@ class TeslaBattery : public CanBattery {
   uint16_t BMS_packTMax = 0;
   bool BMS_pcsNoFlowRequest = false;
   bool BMS_noFlowRequest = false;
-  //0x3C4: PCS_info
+  //0x3C4: PCS_info, or UDS 0xF012 on the PCS (0x628/0x629) - whichever answers first
   uint8_t PCS_partNumber[13] = {0};  //stores raw HEX values for ASCII chars
   bool parsed_PCS_partNumber = false;
   uint16_t PCS_info_buildConfigId = 0;

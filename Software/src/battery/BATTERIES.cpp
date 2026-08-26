@@ -519,11 +519,8 @@ bool user_selected_LEAF_interlock_mandatory = false;
 uint8_t user_selected_LEAF_chg_sta_rq = 0;
 /* User-selected Tesla settings */
 bool user_selected_tesla_digital_HVIL = false;
-uint16_t user_selected_tesla_GTW_country = 17477;
-bool user_selected_tesla_GTW_rightHandDrive = true;
-uint16_t user_selected_tesla_GTW_mapRegion = 2;
-uint16_t user_selected_tesla_GTW_chassisType = 2;
 uint16_t user_selected_tesla_GTW_packEnergy = 1;
+uint16_t user_selected_tesla_soc_source = 0;  //0=socUI (default), 1=socMin, 2=socAvg, 3=socMax, 4=userFacingSoe
 /* User-selected DALY BMS settings */
 int user_selected_daly_power_per_percent = 50;
 int user_selected_daly_power_per_dV = 50;

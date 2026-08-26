@@ -1,5 +1,6 @@
 #include "webserver.h"
 #include <Preferences.h>
+#include <memory>
 #include <vector>
 #include "../../battery/BATTERIES.h"
 #include "../../battery/Battery.h"
@@ -362,6 +363,54 @@ void init_webserver() {
     });
   }
 
+  {
+    // The "battery" query parameter selects which battery the HVC backup routes act on, matching the
+    // index the advanced page posts to the command routes. Defaults to the main battery.
+    auto backup_battery = [](AsyncWebServerRequest* request) {
+      if (request->hasParam("battery")) {
+        String ix = request->getParam("battery")->value();
+        if (ix == "1") {
+          return battery2;
+        }
+        if (ix == "2") {
+          return battery3;
+        }
+      }
+      return battery;
+    };
+
+    // Progress of the backup read, polled by the advanced page so it can start the download.
+    server.on("/hvc_backup_status", HTTP_GET, [backup_battery](AsyncWebServerRequest* request) {
+      Battery* batt = backup_battery(request);
+      if (!batt) {
+        request->send(200, "application/json", "{\"state\":\"unsupported\"}");
+        return;
+      }
+      request->send(200, "application/json", batt->hvc_backup_status_json());
+    });
+
+    // Download the HVC backup JSON (populated by the "Create HVC Backup" action). The partial
+    // document is a few KB, small enough to serve as one response.
+    server.on("/hvc_backup.json", HTTP_GET, [backup_battery](AsyncWebServerRequest* request) {
+      Battery* batt = backup_battery(request);
+      if (!batt || !batt->hvc_backup_available()) {
+        request->send(404, "application/json",
+                      "{\"error\": \"No HVC backup available. Run 'Create HVC Backup' first.\"}");
+        return;
+      }
+      // Named after the pack it was read from; the uptime stamp is only a fallback for a pack that
+      // didn't answer the serial number read.
+      String name = batt->hvc_backup_name();
+      if (name.isEmpty()) {
+        name = format_ms_stamp(millis64());
+      }
+      String filename = "HVC_backup_" + name + ".json";
+      AsyncWebServerResponse* response = request->beginResponse(200, "application/json", batt->hvc_backup_json());
+      response->addHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+      request->send(response);
+    });
+  }
+
 #ifdef SDCARD
   if (datalayer.system.info.SD_logging_active) {
     // Define the handler to delete log file
@@ -428,7 +477,7 @@ void init_webserver() {
   const char* boolSettingNames[] = {
       "DBLBTR",       "CNTCTRL",      "CNTCTRLDBL",    "PWMCNTCTRL",  "PERBMSRESET",   "STATICIP",     "REMBMSRESET",
       "EXTPRECHARGE", "USBENABLED",   "CANLOGUSB",     "WEBENABLED",  "WIFIAPENABLED", "MQTTENABLED",  "NOINVDISC",
-      "HADISC",       "MQTTCELLV",    "GTWRHD",        "DIGITALHVIL", "PERFPROFILE",   "INTERLOCKREQ", "SOCESTIMATED",
+      "HADISC",       "MQTTCELLV",    "DIGITALHVIL",   "PERFPROFILE", "INTERLOCKREQ",  "SOCESTIMATED",
       "PYLONOFFSET",  "PYLONORDER",   "DEYEBYD",       "NCCONTACTOR", "TRIBTR",        "CNTCTRLTRI",   "ESPNOWENABLED",
       "PRIMOGEN24",   "CTINVERT",     "LOWPASSFILTER", "WEBAUTH",     "SLOWCANINV",    "CHGTAPERSOC",  "MEASURECPUTEMP",
       "SYSLOGEN",     "PERBMSDEFSOC", "PERBMSSKIPBAL", "INVOFFGRID",  "CHGESTIMATED",  "MQTTHEAP",     "HADISCFWU",
@@ -441,12 +490,12 @@ void init_webserver() {
   const char* uintSettingNames[] = {
       "BATTCVMAX",  "BATTCVMIN",    "MAXPRETIME",    "MAXPREFREQ",    "WIFICHANNEL",   "DCHGPOWER",     "CHGPOWER",
       "MQTTPORT",   "MQTTTIMEOUT",  "SOFAR_ID",      "PYLONSEND",     "INVCELLS",      "INVMODULES",    "INVCELLSPER",
-      "INVVLEVEL",  "INVCAPACITY",  "INVBTYPE",      "PRECHGMS",      "PWMFREQ",       "PWMHOLD",       "GTWCOUNTRY",
-      "GTWMAPREG",  "GTWCHASSIS",   "GTWPACK",       "LEDMODE",       "GPIOOPT1",      "GPIOOPT2",      "GPIOOPT3",
+      "INVVLEVEL",  "INVCAPACITY",  "INVBTYPE",      "PRECHGMS",      "PWMFREQ",       "PWMHOLD",       "GTWPACK",
+      "LEDMODE",    "GPIOOPT1",     "GPIOOPT2",      "GPIOOPT3",
       "INVSUNTYPE", "GPIOOPT4",     "CTVNOM",        "CTANOM",        "CTATTEN",       "PYLONBAUD",     "PYLONBRAND",
       "DALYPWRPCT", "DALYPWRDV",    "DALYDVSTART",   "DALYPWRDEG",    "DALYPWR0C",     "GPIOOPT5",      "GPIOOPT6",
       "INVICNT",    "FOXESSTYPE",   "FOXESSSUBTYPE", "FOXESSMODULES", "CHGTAPERSTART", "CHGTAPERFLOOR", "SYSLOGPORT",
-      "SYSLOGFAC",  "PERBMSRESETH",
+      "SYSLOGFAC",  "PERBMSRESETH", "TESLASOCSRC",
   };
 
   const char* stringSettingNames[] = {"APPASSWORD", "HOSTNAME",    "MQTTSERVER", "MQTTUSER",  "MQTTPASSWORD",
@@ -590,13 +639,10 @@ void init_webserver() {
                 auto p = request->getParam(boolSetting, true);
                 // The comparison default must match what the firmware boots with when the
                 // key is unset, or saving that state writes nothing and the page keeps
-                // disagreeing with the firmware. Only two bools boot true: WIFIAPENABLED
-                // and GTWRHD (whose boot fallback is the driver global).
+                // disagreeing with the firmware. Only WIFIAPENABLED boots true.
                 bool default_value = false;
                 if (std::string(boolSetting) == std::string("WIFIAPENABLED")) {
                   default_value = true;
-                } else if (std::string(boolSetting) == std::string("GTWRHD")) {
-                  default_value = user_selected_tesla_GTW_rightHandDrive;
                 }
                 const bool value = p != nullptr && p->value() == "on";
                 if (settings.getBool(boolSetting, default_value) != value) {

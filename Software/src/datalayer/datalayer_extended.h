@@ -686,7 +686,19 @@ struct DATALAYER_INFO_TESLA {
   bool BMS_balanceStateUnknown;
   uint16_t BMS_balanceTimeThisCycle_s;
   uint32_t BMS_cumulativeBleedTime_s;
-  
+  /** Per-brick lifetime bleed seconds, read on demand via UDS routine 0x434
+   * (BRICK_GROUP_READ_BLEED_TIME). Index 0 = brick 1. Valid only when
+   * BMS_brickBleedValid is set. */
+  uint32_t BMS_brickBleedTime_s[112];
+  uint16_t BMS_brickCount;
+  uint8_t BMS_brickBleedActiveCount;
+  bool BMS_brickBleedValid;
+  /** Which algorithm the BMS is using to estimate pack capacity, 0x3B2 mux 65.
+   * 0 UNKNOWN, 1 RESTING_POINT_CAC, 2 LIFE_MODEL, 3 UNINITIALIZED_LIFE_MODEL. */
+  uint8_t BMS_cacEstimationSource;
+  /** Transmitted VCFRONT vehicleState: 0 OFF, 1 DRIVE, 2 ACCESSORY, 3 GOING_DOWN. */
+  uint8_t vehicleState;
+  bool balance_at_rest_enabled;
   uint8_t BMS_notEnoughPowerForHeatPump;
   uint8_t BMS_powerLimitState;
   uint8_t BMS_inverterTQF;
@@ -765,8 +777,14 @@ struct DATALAYER_INFO_TESLA {
   uint8_t battery_serialNumber[15];  //stores raw HEX values for ASCII chars
   uint8_t battery_partNumber[12];    //stores raw HEX values for ASCII chars
   uint8_t PCS_partNumber[13];        //stores raw HEX values for ASCII chars
-  uint8_t HVP_partNumber[13];        //stores raw HEX values for ASCII chars
+  //Decoded from the serial number, so accurate to the day the cells were packaged. NULL until a
+  //serial has been read - the web UI must cope with that.
   char* battery_manufactureDate;
+  //ECU firmware-version fingerprint (DID 0xF180 identity + 0x0F00/0x0F02 app CRC per ECU), read on
+  //demand and rendered as one copy/paste line for the packid tool to resolve to an ice release.
+  //0 = idle/never run, 1 = querying, 2 = complete.
+  uint8_t ecu_version_query_state;
+  char ecu_version_fingerprint[256];  //"TESLAVER1;hvbms:F180=..;hvbms:0F00=..;hvp:..;pcs:.." + NUL
 };
 
 struct DATALAYER_INFO_NISSAN_LEAF {

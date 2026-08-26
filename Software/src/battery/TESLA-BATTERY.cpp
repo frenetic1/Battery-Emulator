@@ -1,4 +1,5 @@
 #include "TESLA-BATTERY.h"
+#include <cstdio>   //snprintf for the HVC backup JSON builder
 #include <cstring>  //For unit test
 #include "../battery/BATTERIES.h"
 #include "../communication/can/comm_can.h"
@@ -140,12 +141,12 @@ inline const char* getNoYes(bool value) {
   return value ? "Yes" : "No";
 }
 
-// Clamp DLC to 0â€“8 bytes for classic CAN
+// Clamp DLC to 0-8 bytes for classic CAN
 inline int getDataLen(uint8_t dlc) {
   return std::min<int>(dlc, 8);
 }
 
-// Fast bitâ€field writer: writes 'bitLen' bits of 'value' starting at 'startBit'
+// Fast bit-field writer: writes 'bitLen' bits of 'value' starting at 'startBit'
 inline void setBitField(uint8_t* data, int bytes, int startBit, int bitLen, uint64_t value) {
   int bit = startBit;
   for (int i = 0; i < bitLen && bit < bytes * 8; ++i, ++bit) {
@@ -155,38 +156,28 @@ inline void setBitField(uint8_t* data, int bytes, int startBit, int bitLen, uint
   }
 }
 
-/// Increment a counter field and recompute an 8â€‘bit checksum as part of a mux
-void generateMuxFrameCounterChecksum(CAN_frame& f,
-                                     uint8_t frameCounter,  // counter value
-                                     int ctrStartBit,       // bit index of counter LSB
-                                     int ctrBitLength,      // width of counter in bits
-                                     int csumStartBit,      // bit index of checksum LSB
-                                     int csumBitLength      // width of checksum in bits
-) {
+// Shared core for the Tesla counter+checksum frames: write `counter` into the counter field, then
+// recompute the additive 8-bit checksum (low byte of ID + payload with the checksum bits zeroed +
+// high nibble of the ID's top byte). The two public wrappers differ only in how `counter` is chosen.
+static void applyCounterChecksum(CAN_frame& f, uint64_t counter, int ctrStartBit, int ctrBitLength,
+                                 int csumStartBit, int csumBitLength) {
   int bytes = getDataLen(f.DLC);
   auto data = f.data.u8;
 
-  // Pack payload into a 64â€‘bit word
+  // Pack payload into a 64-bit word and write the counter field
   uint64_t w = 0;
-  for (uint8_t i = 0; i < bytes; ++i) {
+  for (int i = 0; i < bytes; ++i) {
     w |= uint64_t(data[i]) << (8 * i);
   }
-
-  // Increment the counter
-  {
-    uint64_t mask = (uint64_t(1) << ctrBitLength) - 1;
-    uint64_t ctr = frameCounter & mask;  // External counter 0-15
-    w = (w & ~(mask << ctrStartBit)) | (ctr << ctrStartBit);
-  }
-
-  // Unpack back into the frame bytes
-  for (uint8_t i = 0; i < bytes; ++i) {
+  uint64_t mask = (uint64_t(1) << ctrBitLength) - 1;
+  w = (w & ~(mask << ctrStartBit)) | ((counter & mask) << ctrStartBit);
+  for (int i = 0; i < bytes; ++i) {
     data[i] = uint8_t((w >> (8 * i)) & 0xFF);
   }
 
-  // Build a small buffer and zero out the checksum bits
+  // Copy the payload with the checksum bits zeroed, then sum
   uint8_t buf[8];
-  for (uint8_t i = 0; i < bytes; ++i) {
+  for (int i = 0; i < bytes; ++i) {
     buf[i] = data[i];
   }
   for (int bit = csumStartBit; bit < csumStartBit + csumBitLength; ++bit) {
@@ -195,74 +186,31 @@ void generateMuxFrameCounterChecksum(CAN_frame& f,
       break;
     buf[b] &= uint8_t(~(1u << (bit & 7)));
   }
-
-  // Compute checksum offset from most significant hex digit of CAN ID
-  uint8_t checksum_offset = uint8_t((f.ID >> 8) & 0xF);  // high nibble of top byte
-
-  // Sum the low byte of ID + buf[]
   uint8_t sum = uint8_t(f.ID & 0xFF);
   for (int i = 0; i < bytes; ++i) {
     sum = uint8_t(sum + buf[i]);
   }
-  uint8_t checksum = uint8_t(sum + checksum_offset);
-
-  // Write the checksum back into the frame
+  uint8_t checksum = uint8_t(sum + uint8_t((f.ID >> 8) & 0xF));  // + high nibble of ID top byte
   setBitField(data, bytes, csumStartBit, csumBitLength, checksum);
 }
 
-// Increment a counter field and recompute an 8â€‘bit checksum
-void generateFrameCounterChecksum(CAN_frame& f,
-                                  int ctrStartBit,   // bit index of counter LSB
-                                  int ctrBitLength,  // width of counter in bits
-                                  int csumStartBit,  // bit index of checksum LSB
-                                  int csumBitLength  // width of checksum in bits
-) {
-  int bytes = getDataLen(f.DLC);
-  auto data = f.data.u8;
+// Set an externally-supplied counter value (e.g. a shared mux counter), then recompute the checksum.
+void generateMuxFrameCounterChecksum(CAN_frame& f, uint8_t frameCounter, int ctrStartBit, int ctrBitLength,
+                                     int csumStartBit, int csumBitLength) {
+  applyCounterChecksum(f, frameCounter, ctrStartBit, ctrBitLength, csumStartBit, csumBitLength);
+}
 
-  // Pack payload into a 64â€‘bit word
+// Increment the frame's own counter field by +1 (modulo its width), then recompute the checksum.
+void generateFrameCounterChecksum(CAN_frame& f, int ctrStartBit, int ctrBitLength, int csumStartBit,
+                                  int csumBitLength) {
+  int bytes = getDataLen(f.DLC);
   uint64_t w = 0;
   for (int i = 0; i < bytes; ++i) {
-    w |= uint64_t(data[i]) << (8 * i);
+    w |= uint64_t(f.data.u8[i]) << (8 * i);
   }
-
-  // Increment the counter by +1 modulo its width
-  {
-    uint64_t mask = (uint64_t(1) << ctrBitLength) - 1;
-    uint64_t ctr = ((w >> ctrStartBit) & mask) + 1;
-    ctr &= mask;
-    w = (w & ~(mask << ctrStartBit)) | (ctr << ctrStartBit);
-  }
-
-  // Unpack back into the frame bytes
-  for (int i = 0; i < bytes; ++i) {
-    data[i] = uint8_t((w >> (8 * i)) & 0xFF);
-  }
-
-  // Build a small buffer and zero out the checksum bits
-  uint8_t buf[8];
-  for (int i = 0; i < bytes; ++i) {
-    buf[i] = data[i];
-  }
-  for (int bit = csumStartBit; bit < csumStartBit + csumBitLength; ++bit) {
-    int b = bit >> 3;
-    if (b >= bytes)
-      break;
-    buf[b] &= uint8_t(~(1u << (bit & 7)));
-  }
-
-  // Compute checksum offset from most significant hex digit of CAN ID
-  uint8_t checksum_offset = uint8_t((f.ID >> 8) & 0xF);  // high nibble of top byte
-
-  // Sum the low byte of ID + buf[]
-  uint8_t sum = uint8_t(f.ID & 0xFF);
-  for (int i = 0; i < bytes; ++i) {
-    sum = uint8_t(sum + buf[i]);
-  }
-  uint8_t checksum = uint8_t(sum + checksum_offset);
-
-  // Write the checksum back into the frame
-  setBitField(data, bytes, csumStartBit, csumBitLength, checksum);
+  uint64_t mask = (uint64_t(1) << ctrBitLength) - 1;
+  uint64_t ctr = ((w >> ctrStartBit) & mask) + 1;
+  applyCounterChecksum(f, ctr, ctrStartBit, ctrBitLength, csumStartBit, csumBitLength);
 }
 
 // Function to extract raw bits/values from a given CAN frame signal
@@ -456,9 +404,81 @@ void TeslaBattery::
     update_values() {  //This function maps all the values fetched via CAN to the correct parameters used for modbus
   //After values are mapped, we perform some safety checks, and do some serial printouts
 
+  if (datalayer_battery->settings.user_requests_tesla_drive_mode) {
+    datalayer_battery->settings.user_requests_tesla_drive_mode = false;
+    {
+      // An explicit choice outranks the backup's ACCESSORY hold; forget the hold rather than undoing
+      // the user's mode when the read finishes.
+      hvc_bk_accessory_held = false;
+      balance_at_rest_enabled = false;  //a manual choice takes over from the experimental auto mode
+      accessory_mode_forced = false;
+      power_zeroed = false;  //DRIVE removes the power limit
+    }
+  }
+  if (datalayer_battery->settings.user_requests_tesla_accessory_mode) {
+    datalayer_battery->settings.user_requests_tesla_accessory_mode = false;
+    {
+      hvc_bk_accessory_held = false;
+      balance_at_rest_enabled = false;
+      accessory_mode_forced = true;
+      power_zeroed = true;  //ACCESSORY button parks the pack: no charge or discharge
+    }
+  }
+  if (datalayer_battery->settings.user_requests_tesla_toggle_balance_at_rest) {
+    datalayer_battery->settings.user_requests_tesla_toggle_balance_at_rest = false;
+    {
+      balance_at_rest_enabled = !balance_at_rest_enabled;
+      power_zeroed = false;  //auto mode imposes no power limits
+      rest_below_since_ms = 0;
+    }
+  }
+
+  //Experimental: switch vehicleState by load only (no power limits). ANY charge current (positive)
+  //forces DRIVE instantly so a full pack cannot keep charging in ACCESSORY; discharge forces DRIVE
+  //once it exceeds ~1 A. Only truly at rest for the dwell does it drop to ACCESSORY so the pack can
+  //balance. battery_amps > 0 is charge, < 0 is discharge (deci-amps).
+  if (balance_at_rest_enabled) {
+    int32_t discharge_dA = (battery_amps < 0) ? -battery_amps : 0;
+    if (battery_amps > 0 || discharge_dA > TESLA_REST_THRESHOLD_dA) {
+      accessory_mode_forced = false;
+      rest_below_since_ms = 0;
+    } else {
+      if (rest_below_since_ms == 0) {
+        rest_below_since_ms = millis();
+      }
+      if ((millis() - rest_below_since_ms) >= TESLA_REST_DWELL_MS) {
+        accessory_mode_forced = true;
+      }
+    }
+  }
+
   datalayer_battery->status.soh_pptt = 9900;  //Tesla batteries do not send a SOH% value on bus. Hardcode to 99%
 
-  datalayer_battery->status.real_soc = (battery_soc_ui * 10);  //increase SOC range from 0-100.0 -> 100.00
+  //User-selectable SOC source. The 0x292 signals are 0.1%/bit (x10 -> 0-10000 pptt); BMS_userFacingSoe
+  //(0x352 mux2, 2024.20+ pack firmware) is 0.05%/bit (x5). If userFacingSoe is selected but the pack
+  //never sends it (older firmware: stays 0) or reports SNA (2047), fall back to BMS_socUI so real_soc
+  //cannot stick at 0 on a misconfigured source.
+  switch (user_selected_tesla_soc_source) {
+    case 1:  //battery_soc_min (0x292 BMS_socMin)
+      datalayer_battery->status.real_soc = (battery_soc_min * 10);
+      break;
+    case 2:  //battery_soc_avg (0x292 BMS_socAvg)
+      datalayer_battery->status.real_soc = (battery_soc_ave * 10);
+      break;
+    case 3:  //battery_soc_max (0x292 BMS_socMax)
+      datalayer_battery->status.real_soc = (battery_soc_max * 10);
+      break;
+    case 4:  //battery_userFacingSoe (0x352 BMS_userFacingSoe)
+      if (battery_userFacingSoe > 0 && battery_userFacingSoe != 2047) {
+        datalayer_battery->status.real_soc = (battery_userFacingSoe * 5);
+      } else {
+        datalayer_battery->status.real_soc = (battery_soc_ui * 10);
+      }
+      break;
+    default:  //battery_soc_ui (0x292 BMS_socUI)
+      datalayer_battery->status.real_soc = (battery_soc_ui * 10);  //increase SOC range from 0-100.0 -> 100.00
+      break;
+  }
 
   datalayer_battery->status.voltage_dV = battery_volts;
 
@@ -478,6 +498,12 @@ void TeslaBattery::
   //The allowed charge power behaves strangely. We instead estimate this value
   //The inverter setting will ramp down this value based on SOC%
   datalayer_battery->status.max_charge_power_W = datalayer_battery->status.override_charge_power_W;
+
+  //The ACCESSORY button parks the pack with no power allowed until DRIVE is pressed.
+  if (power_zeroed) {
+    datalayer_battery->status.max_discharge_power_W = 0;
+    datalayer_battery->status.max_charge_power_W = 0;
+  }
 
   datalayer_battery->status.temperature_min_dC = battery_min_temp;
 
@@ -539,7 +565,7 @@ void TeslaBattery::
     datalayer.system.status.dc_bus_live = (battery_contactor == 4);
   }
 
-  if (user_selected_tesla_GTW_chassisType > 1) {  //{{0, "Model S"}, {1, "Model X"}, {2, "Model 3"}, {3, "Model Y"}};
+  if (user_selected_battery_type == BatteryType::TeslaModel3Y) {
     // Autodetect algorithm for chemistry on 3/Y packs.
     // NCM/A batteries have 96s, LFP has 102-108s
     // Drawback with this check is that it takes 3-5 minutes before all cells have been counted!
@@ -575,35 +601,102 @@ void TeslaBattery::
 
   // Check if user requests some action
   if (datalayer_battery->settings.user_requests_tesla_isolation_clear) {
-    stateMachineClearIsolationFault = 0;  //Start the isolation fault statemachine
     datalayer_battery->settings.user_requests_tesla_isolation_clear = false;
+    start_sequence(TESLA_UDS_ISO_CLEAR);
   }
+  // The reset commands below need the pack contactors OPEN, which the user does manually (put the car
+  // in a mode that drops them) before pressing the button. A command asked for with the contactors
+  // still closed is refused with a *_FAIL event rather than moving any HV. battery_contactor == 1 is
+  // the BMS reporting its contactors OPEN.
+  const bool contactors_open = (battery_contactor == 1);
   if (datalayer_battery->settings.user_requests_tesla_bms_reset) {
-    if (battery_contactor == 1 && BMS_a180_SW_ECU_reset_blocked == false) {
-      //Start the BMS ECU reset statemachine, only if contactors are OPEN and BMS ECU allows it
-      stateMachineBMSReset = 0;
-      datalayer_battery->settings.user_requests_tesla_bms_reset = false;
+    datalayer_battery->settings.user_requests_tesla_bms_reset = false;
+    if (contactors_open && BMS_a180_SW_ECU_reset_blocked == false) {
+      start_sequence(TESLA_UDS_BMS_RESET);
       logging.println("INFO: BMS reset requested");
     } else {
-      stateMachineBMSReset = 0xFF;
-      datalayer_battery->settings.user_requests_tesla_bms_reset = false;
       set_event(EVENT_BMS_RESET_REQ_FAIL, 0);  // also printing a log entry
       clear_event(EVENT_BMS_RESET_REQ_FAIL);
     }
   }
+  if (datalayer_battery->settings.user_requests_tesla_hvp_reset) {
+    datalayer_battery->settings.user_requests_tesla_hvp_reset = false;
+    if (contactors_open) {
+      pending_ecu_reset_req_id = HVP_UDS_REQUEST;
+      set_event(EVENT_HVP_RESET_REQ_SUCCESS, 0);
+      clear_event(EVENT_HVP_RESET_REQ_SUCCESS);
+    } else {
+      set_event(EVENT_HVP_RESET_REQ_FAIL, 0);
+      clear_event(EVENT_HVP_RESET_REQ_FAIL);
+    }
+  }
+  if (datalayer_battery->settings.user_requests_tesla_pcs_reset) {
+    datalayer_battery->settings.user_requests_tesla_pcs_reset = false;
+    if (contactors_open) {
+      pending_ecu_reset_req_id = PCS_UDS_REQUEST;
+      set_event(EVENT_PCS_RESET_REQ_SUCCESS, 0);
+      clear_event(EVENT_PCS_RESET_REQ_SUCCESS);
+    } else {
+      set_event(EVENT_PCS_RESET_REQ_FAIL, 0);
+      clear_event(EVENT_PCS_RESET_REQ_FAIL);
+    }
+  }
+  if (datalayer_battery->settings.user_requests_tesla_hvc_backup_partial) {
+    datalayer_battery->settings.user_requests_tesla_hvc_backup_partial = false;
+    // ODIN parity: the backup just wants the pack awake. HV up is fine and the contactors are left
+    // exactly where they are.
+    if (start_hvc_backup()) {
+      logging.println("INFO: HVC backup started");
+    } else {
+      refuse_hvc_backup();  // surfaced by hvc_backup_status_json so the UI can say why
+    }
+  }
   if (datalayer_battery->settings.user_requests_tesla_soc_reset) {
-    if ((datalayer_battery->status.real_soc < 1500 || datalayer_battery->status.real_soc > 9000) &&
-        battery_contactor == 1) {
-      //Start the SOC reset statemachine, only if SOC less than 15% or greater than 90%, and contactors open
-      stateMachineSOCReset = 0;
-      datalayer_battery->settings.user_requests_tesla_soc_reset = false;
+    datalayer_battery->settings.user_requests_tesla_soc_reset = false;
+    if (contactors_open &&
+        (datalayer_battery->status.real_soc < 1500 || datalayer_battery->status.real_soc > 9000)) {
+      start_sequence(TESLA_UDS_SOC_RESET);
       logging.println("INFO: SOC reset requested");
     } else {
-      stateMachineSOCReset = 0xFF;
-      datalayer_battery->settings.user_requests_tesla_soc_reset = false;
       set_event(EVENT_BATTERY_SOC_RESET_FAIL, 0, battery_index);  // also printing a log entry
       clear_event(EVENT_BATTERY_SOC_RESET_FAIL, battery_index);
     }
+  }
+  if (datalayer_battery->settings.user_requests_tesla_cac_reset) {
+    datalayer_battery->settings.user_requests_tesla_cac_reset = false;
+    if (contactors_open) {
+      start_sequence(TESLA_UDS_CAC_RESET);
+    } else {
+      set_event(EVENT_CAC_RESET_FAIL, 0);
+      clear_event(EVENT_CAC_RESET_FAIL);
+    }
+  }
+  if (datalayer_battery->settings.user_requests_tesla_clear_blocked_contactors) {
+    datalayer_battery->settings.user_requests_tesla_clear_blocked_contactors = false;
+    // Ends by rebooting the HVBMS and HVP, so it is only run with the contactors already open.
+    if (contactors_open) {
+      start_sequence(TESLA_UDS_CBC);
+      set_event(EVENT_CLEAR_BLOCKED_CONTACTORS_REQ, 0);
+      clear_event(EVENT_CLEAR_BLOCKED_CONTACTORS_REQ);
+    } else {
+      set_event(EVENT_CLEAR_BLOCKED_CONTACTORS_FAIL, 0);
+      clear_event(EVENT_CLEAR_BLOCKED_CONTACTORS_FAIL);
+    }
+  }
+  if (datalayer_battery->settings.user_requests_tesla_disable_isolation) {
+    datalayer_battery->settings.user_requests_tesla_disable_isolation = false;
+    isolation_monitor_disable_latched = true;
+    iso_mon_needs_assert = true;  //asserted once in SUPPORT below, re-armed only on a BMS restart
+    set_event(EVENT_ISOLATION_MONITOR_DISABLED, 0);
+    clear_event(EVENT_ISOLATION_MONITOR_DISABLED);
+  }
+  if (datalayer_battery->settings.user_requests_tesla_enable_isolation) {
+    datalayer_battery->settings.user_requests_tesla_enable_isolation = false;
+    isolation_monitor_disable_latched = false;
+    isolation_monitor_disabling = false;
+    set_event(EVENT_ISOLATION_MONITOR_ENABLED, 0);
+    clear_event(EVENT_ISOLATION_MONITOR_ENABLED);
+    start_sequence(TESLA_UDS_ISO_MON);
   }
 
   //Update 0x333 UI_chargeTerminationPct (bit 16, width 10) value to SOC max value - expose via UI?
@@ -628,16 +721,22 @@ void TeslaBattery::
   if (parsed_battery_serialNumber && battery_serialNumber[13] != 0) {
     memcpy(datalayer_extended.tesla.battery_serialNumber, battery_serialNumber, sizeof(battery_serialNumber));
     datalayer_extended.tesla.battery_manufactureDate = battery_manufactureDate;
-    //We have valid data and comms with the battery, attempt to query part number
-    if (!parsed_battery_partNumber && stateMachineBMSQuery == 0xFF) {
-      stateMachineBMSQuery = 0;
+    //Fallback only. The startup identity pass reads 0xF014 as part of its chain, so this older
+    //serial-triggered query would otherwise race it for the UDS channel and read the same DID twice.
+    //It stays as a safety net for a pack whose identity pass never completed.
+    if (!parsed_battery_partNumber && ident_attempts >= TESLA_IDENT_MAX_ATTEMPTS && !uds_is_busy()) {
+      start_sequence(TESLA_UDS_QUERY);
     }
   }
-  //Via UDS
+  //Via UDS 0xF014 PACKAGE_PART_NUMBER
   if (parsed_battery_partNumber && battery_partNumber[11] != 0) {
     memcpy(datalayer_extended.tesla.battery_partNumber, battery_partNumber, sizeof(battery_partNumber));
   }
-  //0x3C4
+  //Via UDS 0xF012 BOARD_PART_NUMBER on the HVBMS
+  if (parsed_BMS_partNumber && BMS_partNumber[11] != 0) {
+    memcpy(datalayer_extended.tesla.BMS_partNumber, BMS_partNumber, sizeof(BMS_partNumber));
+  }
+  //0x3C4 broadcast, or UDS 0xF012 on the PCS
   if (parsed_PCS_partNumber && PCS_partNumber[11] != 0) {
     memcpy(datalayer_extended.tesla.PCS_partNumber, PCS_partNumber, sizeof(PCS_partNumber));
   }
@@ -702,6 +801,7 @@ void TeslaBattery::
   datalayer_extended.tesla.BMS_balanceStateUnknown = BMS_balanceStateUnknown;
   datalayer_extended.tesla.BMS_balanceTimeThisCycle_s = BMS_balanceTimeThisCycle_s;
   datalayer_extended.tesla.BMS_cumulativeBleedTime_s = BMS_cumulativeBleedTime_s;
+  datalayer_extended.tesla.BMS_cacEstimationSource = BMS_cacEstimationSource;
 
   if (BMS_balanceStateUnknown) {
     set_balancing_status(BALANCING_STATUS_UNKNOWN);
@@ -713,6 +813,54 @@ void TeslaBattery::
     set_balancing_status(BALANCING_STATUS_READY);
   }
 
+  if (datalayer_battery->status.balancing_status == BALANCING_STATUS_ACTIVE) {
+    if (!uds_is_busy() &&
+        (brick_bleed_last_poll == 0 || (millis() - brick_bleed_last_poll) >= TESLA_BLEED_POLL_INTERVAL_MS)) {
+      brick_bleed_last_poll = millis();
+      start_sequence(TESLA_UDS_BLEED);
+    }
+  } else if (datalayer_extended.tesla.BMS_brickBleedValid) {
+    //Balancing has stopped: clear the per-brick cyan and the bleeding summary so nothing is left
+    //latched on, and re-baseline so the next episode is measured from a fresh reading.
+    for (uint16_t i = 0; i < MAX_AMOUNT_CELLS; i++) {
+      datalayer_battery->status.cell_balancing_status[i] = false;
+    }
+    datalayer_extended.tesla.BMS_brickBleedActiveCount = 0;
+    datalayer_extended.tesla.BMS_brickBleedValid = false;
+    brick_bleed_has_prev = false;
+  }
+
+  //The disable persists in the BMS until it resets, so it only needs re-asserting
+  //when the BMS restarts. Detect that as the battery going stale and coming back.
+  bool battery_alive = datalayer_battery->status.CAN_battery_still_alive > 0;
+  if (battery_alive && !battery_was_alive && isolation_monitor_disable_latched) {
+    iso_mon_needs_assert = true;
+  }
+  battery_was_alive = battery_alive;
+
+  if (isolation_monitor_disable_latched && iso_mon_needs_assert && BMS_state == BMS_STATE_SUPPORT &&
+      !uds_is_busy()) {
+    iso_mon_needs_assert = false;
+    isolation_monitor_disabling = true;
+    start_sequence(TESLA_UDS_ISO_MON);
+  }
+
+  //Populate the cell monitor immediately over UDS (DID 0x410) rather than waiting minutes for all
+  //0x401 brick-voltage muxes to broadcast. One-shot once the BMS is reachable; falls back to 0x401.
+  if (!brickv_requested && brickv_attempts < TESLA_BRICKV_MAX_ATTEMPTS && battery_alive && !uds_is_busy() &&
+      datalayer_battery->info.number_of_cells == 0) {
+    brickv_requested = true;
+    brickv_attempts++;
+    start_sequence(TESLA_UDS_BRICKV);
+  }
+
+  //Read the pack identity straight off the ECUs once the BMS is reachable, rather than waiting for
+  //the 0x72A / 0x3C4 broadcasts and deriving the birthday from the serial. One-shot per boot.
+  if (!ident_requested && ident_attempts < TESLA_IDENT_MAX_ATTEMPTS && battery_alive && !uds_is_busy()) {
+    ident_requested = true;
+    ident_attempts++;
+    start_identity_query();
+  }
   datalayer_extended.tesla.BMS_uiChargeStatus = BMS_uiChargeStatus;
   datalayer_extended.tesla.BMS_diLimpRequest = BMS_diLimpRequest;
   datalayer_extended.tesla.BMS_chgPowerAvailable = BMS_chgPowerAvailable;
@@ -1152,10 +1300,23 @@ void TeslaBattery::
   datalayer_extended.tesla.CP_alertMatrixActive[95] = CP_a096_pilotWake;
 
   //Safety checks for CAN message sending
-  if ((datalayer.system.status.inverter_allows_contactor_closing == true) &&
-      (datalayer.system.status.system_status != FAULT) && (!datalayer.system.info.equipment_stop_active)) {
-    // Carry on: 0x221 DRIVE state & reset power down timer
-    vehicleState = CAR_DRIVE;
+  //A diagnostic ACCESSORY hold (HVC backup) keeps the pack awake while the inverter is out of the
+  //picture. A fault or an equipment stop still overrides it and walks 0x221 down as usual - neither
+  //is a moment to be telling the pack the car is on.
+  const bool diagnostic_hold_blocked =
+      (datalayer.system.status.system_status == FAULT) || datalayer.system.info.equipment_stop_active;
+  if (diagnostic_hold_blocked) {
+    release_hvc_backup_hold();
+  }
+  const bool diagnostic_accessory_hold = hvc_bk_accessory_held && !diagnostic_hold_blocked;
+  if ((datalayer.system.status.inverter_allows_contactor_closing == true) && !diagnostic_hold_blocked) {
+    // Carry on: 0x221 DRIVE (or user-forced ACCESSORY) state & reset power down timer
+    vehicleState = accessory_mode_forced ? ACCESSORY : CAR_DRIVE;
+    powerDownSeconds = 9;
+  } else if (diagnostic_accessory_hold) {
+    // Paused, but a diagnostic needs the pack awake. ODIN's own procedures run the car in ACCESSORY
+    // (BMS SUPPORT) and command the contactors over UDS instead of letting the car switch off.
+    vehicleState = ACCESSORY;
     powerDownSeconds = 9;
   } else {
     // Faulted state, or inverter blocks contactor closing
@@ -1173,6 +1334,8 @@ void TeslaBattery::
       powerDownSeconds--;
     }
   }
+  datalayer_extended.tesla.vehicleState = vehicleState;
+  datalayer_extended.tesla.balance_at_rest_enabled = balance_at_rest_enabled;
 
   printFaultCodesIfActive();
   logging.printf("Contactor State: ");
@@ -1215,6 +1378,10 @@ void TeslaBattery::set_balancing_status(balancing_status_enum new_status) {
 void TeslaBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
   // mux, temp, mux0_read, mux1_read are instance member variables (TESLA-BATTERY.h)
 
+  if (handle_incoming_uds_can_frame(rx_frame)) {
+    return;
+  }
+
   switch (rx_frame.ID) {
     case 0x352:  // 850 BMS_energyStatus newer BMS
       datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
@@ -1242,7 +1409,10 @@ void TeslaBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
         mux1_read = true;                                        //Set flag to true
       }
       if (mux == 2) {
-      }  // Additional information needed on this mux 2, example frame: 02 26 02 20 02 80 00 00 doesn't change
+        //BMS_userFacingSoe 52|11@1+ (0.05,0) "%" - added in 2024.20 firmware (bytes 6-7 are 0 on older
+        //packs, e.g. 02 26 02 20 02 80 00 00), 2047 = SNA. Consumed when user_selected_tesla_soc_source = 4.
+        battery_userFacingSoe = (((rx_frame.data.u8[7] << 8) | rx_frame.data.u8[6]) >> 4) & 0x7FF;
+      }
       if (mux0_read && mux1_read) {
         mux0_read = false;
         mux1_read = false;
@@ -1317,7 +1487,7 @@ void TeslaBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
       //BMS_state = // Original code from older DBCs
       //((rx_frame.data.u8[1] >> 3) &
       //(0x0FU));  //0 "STANDBY" 1 "DRIVE" 2 "SUPPORT" 3 "CHARGE" 4 "FEIM" 5 "CLEAR_FAULT" 6 "FAULT" 7 "WELD" 8 "TEST" 9 "SNA" ;
-      BMS_state = static_cast<uint8_t>(extract_signal_value(rx_frame.data.u8, 32, 4));
+      BMS_state = static_cast<uint8_t>(extract_signal_value(rx_frame.data.u8, 32, 4));  //32|4@1+
       //0 "STANDBY" 1 "DRIVE" 2 "SUPPORT" 3 "CHARGE" 4 "FEIM" 5 "CLEAR_FAULT" 6 "FAULT" 7 "WELD" 8 "TEST" 9 "SNA" 10 "BMS_DIAG";
       BMS_hvState = (rx_frame.data.u8[2] & (0x07U));
       //0 "DOWN" 1 "COMING_UP" 2 "GOING_DOWN" 3 "UP_FOR_DRIVE" 4 "UP_FOR_CHARGE" 5 "UP_FOR_DC_CHARGE" 6 "UP" ;
@@ -1389,20 +1559,22 @@ void TeslaBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
           ((rx_frame.data.u8[5] >> 2) & (0x01U));  //BMS_notEnoughPowerForHeatPump : 42|1@1+ (1,0) [0|1] ""  Receiver
       BMS_powerLimitState =
           (rx_frame.data.u8[6] &
-           (0x01U));  //BMS_powerLimitsState : 48|1@1+ (1,0) [0|1] 0 "NOT_CALCULATED_FOR_DRIVE" 1 "CALCULATED_FOR_DRIVE"
+           (0x01U));  //BMS_powerLimitsState : 48|1 in 2021.24.4..2025.14.7; moved to bit 42 only at
+      //2025.20.3+. The bench pack's HVBMS bootloader (0xF180 identity, packid) is 0x31ca5286, the
+      //pre-2024.44.3.1 boot -> firmware <=2024.38.7 -> bit 48 is correct here. Reading bit 42 on this
+      //pack would return notEnoughPowerForHeatPump instead. Revisit if a 2025.20.3+ pack is used.
       BMS_inverterTQF = ((rx_frame.data.u8[7] >> 4) & (0x03U));
       break;
     case 0x132:  //battery amps/volts //HVBattAmpVolt  (tesla-m3-pack-findings fw 2019.20.4.2 names 0x132 = BMS_hvBusStatus)
       datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      battery_volts = ((rx_frame.data.u8[1] << 8) | rx_frame.data.u8[0]) *
-                      0.1;  //0|16@1+ (0.01,0) [0|655.35] "V"  //Example 37030mv * 0.01 = 3703dV
+      battery_volts = ((rx_frame.data.u8[1] << 8) | rx_frame.data.u8[0]) /
+                      10;  //0|16@1+ (0.01,0) [0|655.35] "V" -> dV. Integer /10 (was *0.1): identical result
+                           //for the unsigned raw, avoids software double emulation on this ~10Hz frame.
       battery_amps =
           ((rx_frame.data.u8[3] << 8) |
            rx_frame.data.u8
                [2]);  //SmoothBattCurrent : 16|16@1- (-0.1,0) [-3276.7|3276.7] "A"//Example 65492 (-4.3A) OR 225 (22.5A)
-      battery_raw_amps =
-          ((rx_frame.data.u8[5] << 8) | rx_frame.data.u8[4]) * -0.05 +
-          822;  //RawBattCurrent : 32|16@1- (-0.05,822) [-1138.35|2138.4] "A"  //Example 10425 * -0.05 = ?
+      //RawBattCurrent (32|16@1- (-0.05,822) "A") is not consumed anywhere, so it is not decoded.
       battery_charge_time_remaining =
           (((rx_frame.data.u8[7] & 0x0F) << 8) |
            rx_frame.data.u8[6]);  //ChargeHoursRemaining : 48|12@1+ (1,0) [0|4095] "Min"  //Example 228 * 0.1 = 22.8min
@@ -1454,6 +1626,9 @@ void TeslaBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
         //BMS_cumulativeBleedTime m39 : 8|24@1+ (1,0) "s"
         BMS_cumulativeBleedTime_s = ((uint32_t)rx_frame.data.u8[3] << 16) |
                                     ((uint32_t)rx_frame.data.u8[2] << 8) | rx_frame.data.u8[1];
+      } else if (mux == 65) {
+        //BMS_cacEstimationSource m65 : 60|2@1+ (1,0)
+        BMS_cacEstimationSource = (rx_frame.data.u8[7] >> 4) & 0x03;
       }
       break;
     case 0x332:  //min/max hist values //BattBrickMinMax:  (tesla-m3-pack-findings fw 2019.20.4.2 names 0x332 = BMS_bmbMinMax)
@@ -1607,6 +1782,11 @@ void TeslaBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
     case 0x401:  // Cell stats  //BrickVoltages
       datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
       mux = (rx_frame.data.u8[0]);  //MultiplexSelector M : 0|8@1+ (1,0) [0|0] ""
+      // mux is an untrusted bus byte (0-255) used to index cell_voltages_mV[mux*3 + 0..2]. A bad or
+      // unexpected frame with mux >= MAX_AMOUNT_CELLS/3 would write past the array; guard against it.
+      if ((uint16_t)mux * 3 + 2 >= MAX_AMOUNT_CELLS) {
+        break;
+      }
                                     //StatusFlags : 8|8@1+ (1,0) [0|0] ""
                                     //Brick0 m0 : 16|16@1+ (0.0001,0) [0|0] "V"
                                     //Brick1 m0 : 32|16@1+ (0.0001,0) [0|0] "V"
@@ -2203,16 +2383,7 @@ void TeslaBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
       }
       if (battery_serialNumber[6] != 0 && battery_serialNumber[12] != 0 &&
           !parsed_battery_serialNumber) {  // Serial number complete
-        //Manufacture year
-        char yearStr[5];  // Full year string (including the "20" prefix)
-        snprintf(yearStr, sizeof(yearStr), "20%c%c", battery_serialNumber[3], battery_serialNumber[4]);
-        int year = atoi(yearStr);
-        //Manufacture day (Julian calendar)
-        char dayStr[4];
-        snprintf(dayStr, sizeof(dayStr), "%c%c%c", battery_serialNumber[5], battery_serialNumber[6],
-                 battery_serialNumber[7]);
-        int day = atoi(dayStr);
-        battery_manufactureDate = dayOfYearToDate(year, day);
+        derive_manufacture_date_from_serial();
         parsed_battery_serialNumber = true;
       }
       break;
@@ -2342,79 +2513,29 @@ void TeslaBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
       }
       */
       break;
-    case 0x612:  // CAN UDS responses for BMS
-      datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
-      //BMS Query
-      if (stateMachineBMSQuery != 0xFF && stateMachineBMSReset == 0xFF && stateMachineSOCReset == 0xFF) {
-        if (memcmp(rx_frame.data.u8, "\x02\x50\x03\xAA\xAA\xAA\xAA\xAA", 8) == 0) {
-          //Received initial response, proceed to actual query
-          logging.println("CAN UDS: Received BMS query initial handshake reply");
-          stateMachineBMSQuery = 1;
-          break;
-        }
-        if (rx_frame.data.u8[0] == 0x10) {
-          //Received first data frame
-          battery_partNumber[0] = rx_frame.data.u8[5];
-          battery_partNumber[1] = rx_frame.data.u8[6];
-          battery_partNumber[2] = rx_frame.data.u8[7];
-          logging.println("CAN UDS: Received BMS query data frame");
-          stateMachineBMSQuery = 2;
-          break;
-        }
-        if (rx_frame.data.u8[0] == 0x21) {
-          //Second part of part number after flow control
-          battery_partNumber[3] = rx_frame.data.u8[1];
-          battery_partNumber[4] = rx_frame.data.u8[2];
-          battery_partNumber[5] = rx_frame.data.u8[3];
-          battery_partNumber[6] = rx_frame.data.u8[4];
-          battery_partNumber[7] = rx_frame.data.u8[5];
-          battery_partNumber[8] = rx_frame.data.u8[6];
-          battery_partNumber[9] = rx_frame.data.u8[7];
-          logging.println("CAN UDS: Received BMS query second data frame");
-          break;
-        }
-        if (rx_frame.data.u8[0] == 0x22) {
-          //Final part of part number
-          battery_partNumber[10] = rx_frame.data.u8[1];
-          battery_partNumber[11] = rx_frame.data.u8[2];
-          logging.println("CAN UDS: Received BMS query final data frame");
-          break;
-        }
-        if (memcmp(rx_frame.data.u8, "\x23\x00\x00\x00\xAA\xAA\xAA\xAA", 8) == 0) {
-          //Received final frame
-          logging.println("CAN UDS: Received BMS query termination frame");
-          parsed_battery_partNumber = true;
-          stateMachineBMSQuery = 0xFF;
-          break;
-        }
-      }
-      //BMS ECU responses
-      if (memcmp(rx_frame.data.u8, "\x02\x67\x06\xAA\xAA\xAA\xAA\xAA", 8) == 0) {
-        logging.println("CAN UDS: BMS ECU unlocked");
-      }
-      if (memcmp(rx_frame.data.u8, "\x03\x7F\x11\x78\xAA\xAA\xAA\xAA", 8) == 0) {
-        logging.println("CAN UDS: BMS ECU reset request successful but ECU busy, response pending");
-      }
-      if (memcmp(rx_frame.data.u8, "\x02\x51\x01\xAA\xAA\xAA\xAA\xAA", 8) == 0) {
-        set_event(EVENT_BMS_RESET_REQ_SUCCESS, 0);  // also printing a log entry
-        clear_event(EVENT_BMS_RESET_REQ_SUCCESS);
-      }
-      if (memcmp(rx_frame.data.u8, "\x05\x71\x01\x04\x07\x01\xAA\xAA", 8) == 0) {
-        set_event(EVENT_BATTERY_SOC_RESET_SUCCESS, 0, battery_index);  // also printing a log entry
-        clear_event(EVENT_BATTERY_SOC_RESET_SUCCESS, battery_index);
-        stateMachineBMSReset = 6;  // BMS ECU already unlocked etc. so we jump straight to reset
-      }
-      if (memcmp(rx_frame.data.u8, "\x05\x71\x01\x04\x07\x00\xAA\xAA", 8) == 0) {
-        set_event(EVENT_BATTERY_SOC_RESET_FAIL, 0, battery_index);  // also printing a log entry
-        clear_event(EVENT_BATTERY_SOC_RESET_FAIL, battery_index);
-      }
-      break;
     default:
       break;
   }
 }
 
 void TeslaBattery::transmit_can(unsigned long currentMillis) {
+  transmit_uds_can(currentMillis);
+
+  // On-demand ECU firmware-version read, once the shared UDS channel is free.
+  if (ecu_version_query_requested && !uds_is_busy()) {
+    start_ecu_version_query();
+  }
+  // Queue a requested HVC backup as soon as the framework's sequence slot is free.
+  if (hvc_bk_phase != HVC_BK_IDLE && !hvc_bk_queued && start_sequence(TESLA_UDS_HVC)) {
+    hvc_bk_queued = true;
+  }
+
+  //Send any queued HVP/PCS ECU reset (requested from the web UI, gated on contactors-open above).
+  if (pending_ecu_reset_req_id != 0) {
+    send_ecu_reset(pending_ecu_reset_req_id);
+    pending_ecu_reset_req_id = 0;
+  }
+
   // Ensure we only send one message branch at a time, to reduce worst-case
   // runtime.
   // transmitPhase is an instance member variable (TESLA-BATTERY.h)
@@ -2425,6 +2546,7 @@ void TeslaBattery::transmit_can(unsigned long currentMillis) {
   //Send 10ms messages
   if (currentMillis - previousMillis10 >= INTERVAL_10_MS && transmitPhase == 0) {
     previousMillis10 = currentMillis;
+
 
     if (user_selected_tesla_digital_HVIL) {  //Special Digital HVIL mode for S/X 2024+ batteries
       if ((datalayer.system.status.inverter_allows_contactor_closing) &&
@@ -2517,12 +2639,28 @@ void TeslaBattery::transmit_can(unsigned long currentMillis) {
     frameCounter_TESLA_221 = (frameCounter_TESLA_221 + 1) % 16;
 
     //0x3C2 VCLEFT_switchStatus
-    transmit_can_frame(alternateMux == 0 ? &TESLA_3C2_Mux0 : &TESLA_3C2_Mux1);
+    if (TESLA_3C2_INITIAL_SENT == false) {
+      transmit_can_frame(&TESLA_3C2_INITIAL);
+      TESLA_3C2_INITIAL_SENT = true;
+    } else {
+      transmit_can_frame(alternateMux == 0 ? &TESLA_3C2_Mux0 : &TESLA_3C2_Mux1);
+    }
 
-    //0x39D IBST_status
-    transmit_can_frame(&TESLA_39D);
+    //0x39D IBST_status. First frame.
+    if (TESLA_39D_INITIAL_SENT == false) {
+      transmit_can_frame(&TESLA_39D_INITIAL);
+      TESLA_39D_INITIAL_SENT = true;
+    } else {
+      transmit_can_frame(&TESLA_39D);
+    }
 
-    if (battery_contactor == 4) {  // Contactors closed
+    //0x3A1 VCFRONT_vehicleStatus: only start sending this once the pack advertises
+    //>=100kW discharge (raw 7692 on 0x252), not just on contactor close - then stream it for the
+    //rest of the power cycle.
+    if (!tesla_3A1_armed && battery_contactor == 4 && BMS_maxDischargePower >= TESLA_3A1_ARM_DISCHARGE_RAW) {
+      tesla_3A1_armed = true;
+    }
+    if (tesla_3A1_armed) {  // Contactors have closed AND drive power has ramped past ~100kW at least once
 
       // Frames to be sent only when contactors closed
       if (timeToMux3A1) {
@@ -2567,10 +2705,10 @@ void TeslaBattery::transmit_can(unsigned long currentMillis) {
     transmit_can_frame(&TESLA_241);
     //0x2D1 VCFRONT_okToUseHighPower, static
     transmit_can_frame(&TESLA_2D1);
-    //0x2A8 CMPD_state
-    transmit_can_frame(&TESLA_2A8);
-    //0x2E8 EPBR_status
+    //0x2E8 EPBR_status queued BEFORE its 0x2A8 EPBL_status pair
     transmit_can_frame(&TESLA_2E8);
+    //0x2A8 EPBL_status
+    transmit_can_frame(&TESLA_2A8);
     //0x7FF GTW_carConfig
     switch (muxNumber_TESLA_7FF) {
       case 0:
@@ -2594,177 +2732,9 @@ void TeslaBattery::transmit_can(unsigned long currentMillis) {
     muxNumber_TESLA_7FF = (muxNumber_TESLA_7FF + 1) % 5;  //Cycle betweeen 0-1-2-3-4-0...
     //Generate next frames
     generateTESLA_229(TESLA_229);
-    generateFrameCounterChecksum(TESLA_2A8, 52, 4, 56, 8);
+    //Both advance together
     generateFrameCounterChecksum(TESLA_2E8, 52, 4, 56, 8);
-
-    if (stateMachineClearIsolationFault != 0xFF) {
-      //This implementation should be rewritten to actually reply to the UDS responses sent by the BMS
-      //While this may work, it is not the correct way to implement this clearing logic
-      switch (stateMachineClearIsolationFault) {
-        case 0:
-          TESLA_602.data = {0x02, 0x27, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00};
-          transmit_can_frame(&TESLA_602);
-          stateMachineClearIsolationFault = 1;
-          break;
-        case 1:
-          TESLA_602.data = {0x30, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00};
-          transmit_can_frame(&TESLA_602);
-          // BMS should reply 02 50 C0 FF FF FF FF FF
-          stateMachineClearIsolationFault = 2;
-          break;
-        case 2:
-          TESLA_602.data = {0x10, 0x12, 0x27, 0x06, 0x35, 0x34, 0x37, 0x36};
-          transmit_can_frame(&TESLA_602);
-          // BMS should reply 7E FF FF FF FF FF FF
-          stateMachineClearIsolationFault = 3;
-          break;
-        case 3:
-          TESLA_602.data = {0x21, 0x31, 0x30, 0x33, 0x32, 0x3D, 0x3C, 0x3F};
-          transmit_can_frame(&TESLA_602);
-          stateMachineClearIsolationFault = 4;
-          break;
-        case 4:
-          TESLA_602.data = {0x22, 0x3E, 0x39, 0x38, 0x3B, 0x3A, 0x00, 0x00};
-          transmit_can_frame(&TESLA_602);
-          //Should generate a CAN UDS log message indicating ECU unlocked
-          stateMachineClearIsolationFault = 5;
-          break;
-        case 5:
-          TESLA_602.data = {0x04, 0x31, 0x01, 0x04, 0x0A, 0x00, 0x00, 0x00};
-          transmit_can_frame(&TESLA_602);
-          stateMachineClearIsolationFault = 0xFF;
-          break;
-        default:
-          //Something went wrong. Reset all and cancel
-          stateMachineClearIsolationFault = 0xFF;
-          break;
-      }
-    }
-    if (stateMachineBMSReset != 0xFF) {
-      //This implementation should be rewritten to actually reply to the UDS responses sent by the BMS
-      //While this may work, it is not the correct way to implement this reset logic
-      switch (stateMachineBMSReset) {
-        case 0:
-          TESLA_602.data = {0x02, 0x27, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00};
-          transmit_can_frame(&TESLA_602);
-          stateMachineBMSReset = 1;
-          break;
-        case 1:
-          TESLA_602.data = {0x30, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00};
-          transmit_can_frame(&TESLA_602);
-          stateMachineBMSReset = 2;
-          break;
-        case 2:
-          TESLA_602.data = {0x10, 0x12, 0x27, 0x06, 0x35, 0x34, 0x37, 0x36};
-          transmit_can_frame(&TESLA_602);
-          stateMachineBMSReset = 3;
-          break;
-        case 3:
-          TESLA_602.data = {0x21, 0x31, 0x30, 0x33, 0x32, 0x3D, 0x3C, 0x3F};
-          transmit_can_frame(&TESLA_602);
-          stateMachineBMSReset = 4;
-          break;
-        case 4:
-          TESLA_602.data = {0x22, 0x3E, 0x39, 0x38, 0x3B, 0x3A, 0x00, 0x00};
-          transmit_can_frame(&TESLA_602);
-          //Should generate a CAN UDS log message indicating ECU unlocked
-          stateMachineBMSReset = 5;
-          break;
-        case 5:
-          TESLA_602.data = {0x02, 0x10, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00};
-          transmit_can_frame(&TESLA_602);
-          stateMachineBMSReset = 6;
-          break;
-        case 6:
-          TESLA_602.data = {0x02, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00};
-          transmit_can_frame(&TESLA_602);
-          stateMachineBMSReset = 7;
-          break;
-        case 7:
-          TESLA_602.data = {0x02, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00};
-          transmit_can_frame(&TESLA_602);
-          //Should generate a CAN UDS log message(s) indicating ECU has reset
-          stateMachineBMSReset = 0xFF;
-          break;
-        default:
-          //Something went wrong. Reset all and cancel
-          stateMachineBMSReset = 0xFF;
-          break;
-      }
-    }
-    if (stateMachineSOCReset != 0xFF) {
-      //This implementation should be rewritten to actually reply to the UDS responses sent by the BMS
-      //While this may work, it is not the correct way to implement this
-      switch (stateMachineSOCReset) {
-        case 0:
-          TESLA_602.data = {0x02, 0x27, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00};
-          transmit_can_frame(&TESLA_602);
-          stateMachineSOCReset = 1;
-          break;
-        case 1:
-          TESLA_602.data = {0x30, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00};
-          transmit_can_frame(&TESLA_602);
-          stateMachineSOCReset = 2;
-          break;
-        case 2:
-          TESLA_602.data = {0x10, 0x12, 0x27, 0x06, 0x35, 0x34, 0x37, 0x36};
-          transmit_can_frame(&TESLA_602);
-          stateMachineSOCReset = 3;
-          break;
-        case 3:
-          TESLA_602.data = {0x21, 0x31, 0x30, 0x33, 0x32, 0x3D, 0x3C, 0x3F};
-          transmit_can_frame(&TESLA_602);
-          stateMachineSOCReset = 4;
-          break;
-        case 4:
-          TESLA_602.data = {0x22, 0x3E, 0x39, 0x38, 0x3B, 0x3A, 0x00, 0x00};
-          transmit_can_frame(&TESLA_602);
-          //Should generate a CAN UDS log message indicating ECU unlocked
-          stateMachineSOCReset = 5;
-          break;
-        case 5:
-          TESLA_602.data = {0x04, 0x31, 0x01, 0x04, 0x07, 0x00, 0x00, 0x00};
-          transmit_can_frame(&TESLA_602);
-          stateMachineSOCReset = 0xFF;
-          break;
-        default:
-          //Something went wrong. Reset all and cancel
-          stateMachineSOCReset = 0xFF;
-          break;
-      }
-    }
-    if (stateMachineBMSQuery != 0xFF) {
-      //This implementation should be rewritten to actually reply to the UDS responses sent by the BMS
-      //While this may work, it is not the correct way to implement this query logic
-      switch (stateMachineBMSQuery) {
-        case 0:
-          //Initial request
-          logging.println("CAN UDS: Sending BMS query initial handshake");
-          TESLA_602.data = {0x02, 0x10, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00};
-          transmit_can_frame(&TESLA_602);
-          break;
-        case 1:
-          //Send query
-          logging.println("CAN UDS: Sending BMS query for pack part number");
-          TESLA_602.data = {0x03, 0x22, 0xF0, 0x14, 0x00, 0x00, 0x00, 0x00};
-          transmit_can_frame(&TESLA_602);
-          break;
-        case 2:
-          //Flow control
-          logging.println("CAN UDS: Sending BMS query flow control");
-          TESLA_602.data = {0x30, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00};
-          transmit_can_frame(&TESLA_602);
-          break;
-        case 3:
-          break;
-        case 4:
-          break;
-        default:
-          //Something went wrong. Reset all and cancel
-          stateMachineBMSQuery = 0xFF;
-          break;
-      }
-    }
+    generateFrameCounterChecksum(TESLA_2A8, 52, 4, 56, 8);
   }
 
   //Send 500ms messages
@@ -2774,7 +2744,14 @@ void TeslaBattery::transmit_can(unsigned long currentMillis) {
     transmit_can_frame(&TESLA_213);
     transmit_can_frame(&TESLA_284);
     transmit_can_frame(&TESLA_293);
-    transmit_can_frame(&TESLA_313);
+    //0x313: first frame out of reset (counter 4); TESLA_313 is seeded to
+    //counter 4 so the regenerate below carries the sequence on at 5.
+    if (TESLA_313_INITIAL_SENT == false) {
+      transmit_can_frame(&TESLA_313_INITIAL);
+      TESLA_313_INITIAL_SENT = true;
+    } else {
+      transmit_can_frame(&TESLA_313);
+    }
     transmit_can_frame(&TESLA_333);
     if (TESLA_334_INITIAL_SENT == false) {
       transmit_can_frame(&TESLA_334_INITIAL);
@@ -3011,19 +2988,1023 @@ void TeslaBattery::printFaultCodesPcsCp() {
   }
 }
 
+static uint16_t tesla_build_security_key(uint8_t* out, const uint8_t* seed_response, uint16_t len, uint8_t key_subfn) {
+  if (len < 18) {
+    return 0;
+  }
+  out[0] = key_subfn;
+  for (uint8_t i = 0; i < 16; i++) {
+    out[i + 1] = seed_response[2 + i] ^ 0x35;
+  }
+  return 17;
+}
+
+void TeslaBattery::start_routine(uint16_t next_state, uint16_t routine_id) {
+  uint8_t req[3] = {0x01, (uint8_t)(routine_id >> 8), (uint8_t)(routine_id & 0xFF)};
+  send_sequence_message(next_state, SID::RoutineControl, req, sizeof(req));
+}
+
+void TeslaBattery::on_uds_sequence_step(uint16_t state, uint8_t sid, const uint8_t* data, uint16_t len) {
+  const bool negative = (sid == kNegativeResponseSid);
+  uint8_t key[17];
+
+  switch (state) {
+    case TESLA_UDS_BMS_RESET:
+      send_sequence_message(TESLA_UDS_BMS_RESET_ECU, SID::DiagnosticSessionControl, (const uint8_t*)"\x03", 1);
+      break;
+    case TESLA_UDS_BMS_RESET_ECU:
+      if (negative) {
+        on_uds_sequence_timeout(state);
+        break;
+      }
+      send_sequence_message(TESLA_UDS_BMS_RESET_DONE, SID::ECUReset, (const uint8_t*)"\x01", 1);
+      break;
+    case TESLA_UDS_BMS_RESET_DONE:
+      if (negative) {
+        on_uds_sequence_timeout(state);
+        break;
+      }
+      set_event(EVENT_BMS_RESET_REQ_SUCCESS, 0);
+      clear_event(EVENT_BMS_RESET_REQ_SUCCESS);
+      break;
+
+    case TESLA_UDS_SOC_RESET:
+      send_sequence_message(TESLA_UDS_SOC_RESET_SESSION, SID::DiagnosticSessionControl, (const uint8_t*)"\x03", 1);
+      break;
+    case TESLA_UDS_SOC_RESET_SESSION:
+      if (negative) {
+        on_uds_sequence_timeout(state);
+        break;
+      }
+      send_sequence_message(TESLA_UDS_SOC_RESET_KEY, SID::SecurityAccess, (const uint8_t*)"\x05", 1);
+      break;
+    case TESLA_UDS_SOC_RESET_KEY:
+      if (negative || !tesla_build_security_key(key, data, len, SECURITY_LEVEL_5 + 1)) {
+        on_uds_sequence_timeout(state);
+        break;
+      }
+      send_sequence_message(TESLA_UDS_SOC_RESET_ROUTINE, SID::SecurityAccess, key, 17);
+      break;
+    case TESLA_UDS_SOC_RESET_ROUTINE:
+      if (negative) {
+        on_uds_sequence_timeout(state);
+        break;
+      }
+      start_routine(TESLA_UDS_SOC_RESET_RESULT, RID_RESET_SOC);
+      break;
+    case TESLA_UDS_SOC_RESET_RESULT:
+      if (negative || len < 5 || data[4] != 0x01) {
+        on_uds_sequence_timeout(state);
+        break;
+      }
+      set_event(EVENT_BATTERY_SOC_RESET_SUCCESS, 0, battery_index);
+      clear_event(EVENT_BATTERY_SOC_RESET_SUCCESS, battery_index);
+      send_sequence_message(TESLA_UDS_SOC_RESET_ECU, SID::DiagnosticSessionControl, (const uint8_t*)"\x01", 1);
+      break;
+    case TESLA_UDS_SOC_RESET_ECU:
+      send_sequence_message(TESLA_UDS_SOC_RESET_DONE, SID::ECUReset, (const uint8_t*)"\x01", 1);
+      break;
+    case TESLA_UDS_SOC_RESET_DONE:
+      break;
+
+    case TESLA_UDS_ISO_CLEAR:
+      send_sequence_message(TESLA_UDS_ISO_CLEAR_SESSION, SID::DiagnosticSessionControl, (const uint8_t*)"\x03", 1);
+      break;
+    case TESLA_UDS_ISO_CLEAR_SESSION:
+      if (negative) {
+        break;
+      }
+      {
+        uint8_t seed_req[1] = {SECURITY_LEVEL_19};
+        send_sequence_message(TESLA_UDS_ISO_CLEAR_KEY, SID::SecurityAccess, seed_req, 1);
+      }
+      break;
+    case TESLA_UDS_ISO_CLEAR_KEY:
+      if (negative || !tesla_build_security_key(key, data, len, SECURITY_LEVEL_19 + 1)) {
+        break;
+      }
+      send_sequence_message(TESLA_UDS_ISO_CLEAR_COUNTERS, SID::SecurityAccess, key, 17);
+      break;
+    case TESLA_UDS_ISO_CLEAR_COUNTERS:
+      if (negative) {
+        break;
+      }
+      start_routine(TESLA_UDS_ISO_CLEAR_FLOOD, RID_RESET_ISOLATION_COUNTERS);
+      break;
+    case TESLA_UDS_ISO_CLEAR_FLOOD:
+      start_routine(TESLA_UDS_ISO_CLEAR_INTERNAL, RID_CLEAR_BATTERY_COOLANT_FLOOD_ALERT);
+      break;
+    case TESLA_UDS_ISO_CLEAR_INTERNAL:
+      start_routine(TESLA_UDS_ISO_CLEAR_DONE, RID_CLEAR_INTERNAL_ISOLATION_ALERT);
+      break;
+    case TESLA_UDS_ISO_CLEAR_DONE:
+      break;
+
+    // ODIN "Blocked Contactors - Attempt to Clear" (Gen3): VSH latch reset, isolation-condition clear
+    // (counters + coolant flood + internal isolation), HVBMS reset, then HVP reset.
+    // All HVBMS routines run under one extended session + security.
+    case TESLA_UDS_CBC:
+      send_sequence_message(TESLA_UDS_CBC_SESSION, SID::DiagnosticSessionControl, (const uint8_t*)"\x03", 1);
+      break;
+    case TESLA_UDS_CBC_SESSION:
+      if (negative) {
+        break;
+      }
+      {
+        uint8_t seed_req[1] = {SECURITY_LEVEL_19};
+        send_sequence_message(TESLA_UDS_CBC_KEY, SID::SecurityAccess, seed_req, 1);
+      }
+      break;
+    case TESLA_UDS_CBC_KEY:
+      if (negative || !tesla_build_security_key(key, data, len, SECURITY_LEVEL_19 + 1)) {
+        break;
+      }
+      start_routine(TESLA_UDS_CBC_VSH, RID_RESET_VSH_FAULT);
+      break;
+    case TESLA_UDS_CBC_VSH:
+      start_routine(TESLA_UDS_CBC_COUNTERS, RID_RESET_ISOLATION_COUNTERS);
+      break;
+    case TESLA_UDS_CBC_COUNTERS:
+      start_routine(TESLA_UDS_CBC_FLOOD, RID_CLEAR_BATTERY_COOLANT_FLOOD_ALERT);
+      break;
+    case TESLA_UDS_CBC_FLOOD:
+      start_routine(TESLA_UDS_CBC_INTERNAL, RID_CLEAR_INTERNAL_ISOLATION_ALERT);
+      break;
+    case TESLA_UDS_CBC_INTERNAL:
+      // Reset the HVBMS itself (ECUReset on 0x602). Failure of the alert-clear routines is not fatal
+      // to the attempt - ODIN still resets the ECUs - so we proceed regardless of `negative`.
+      send_sequence_message(TESLA_UDS_CBC_HVBMS, SID::ECUReset, (const uint8_t*)"\x01", 1);
+      break;
+    case TESLA_UDS_CBC_HVBMS:
+      // HVBMS reboot acknowledged (or timed out). Queue the HVP ECUReset (0x610), completing the set.
+      pending_ecu_reset_req_id = HVP_UDS_REQUEST;
+      break;
+    case TESLA_UDS_CBC_DONE:
+      break;
+
+    case TESLA_UDS_QUERY:
+      send_sequence_message(TESLA_UDS_QUERY_READ, SID::DiagnosticSessionControl, (const uint8_t*)"\x03", 1);
+      break;
+    case TESLA_UDS_QUERY_READ:
+      if (negative) {
+        break;
+      }
+      send_sequence_message(TESLA_UDS_QUERY_PARSE, SID::ReadDataByIdentifier, (const uint8_t*)"\xF0\x14", 2);
+      break;
+    case TESLA_UDS_QUERY_PARSE:
+      if (negative || len < 15) {
+        break;
+      }
+      for (uint8_t i = 0; i < 12; i++) {
+        battery_partNumber[i] = data[3 + i];
+      }
+      parsed_battery_partNumber = true;
+      break;
+
+    case TESLA_UDS_VERSION:  // entry: open an extended session on the BMS
+      send_sequence_message(TESLA_UDS_VERSION_SESSION, SID::DiagnosticSessionControl, (const uint8_t*)"\x03", 1);
+      break;
+    // The rest of the version chain: store whatever arrived, then let ecu_version_continue send
+    // the next read (or stamp the fingerprint at the end). Negative responses store nothing.
+    case TESLA_UDS_VERSION_SESSION:
+    case TESLA_UDS_VERSION_F180:
+    case TESLA_UDS_VERSION_0F00:
+    case TESLA_UDS_VERSION_HVP_F180:
+    case TESLA_UDS_VERSION_HVP_0F00:
+    case TESLA_UDS_VERSION_PCS_F180:
+    case TESLA_UDS_VERSION_PCS_0F00:
+    case TESLA_UDS_VERSION_PCS_0F02:
+    case TESLA_UDS_VERSION_PCS_F012:
+      if (!negative) {
+        EcuVersion& ev = (state <= TESLA_UDS_VERSION_0F00)       ? ecu_ver_bms
+                         : (state <= TESLA_UDS_VERSION_HVP_0F00) ? ecu_ver_hvp
+                                                                 : ecu_ver_pcs;
+        ecu_version_store_did(ev, data, len);
+      }
+      ecu_version_continue(state);
+      break;
+
+    // ---- startup identity pass (HVBMS 0x602/0x612) ----
+    case TESLA_UDS_IDENT:  // entry: open an extended session
+      send_sequence_message(TESLA_UDS_IDENT_SESSION, SID::DiagnosticSessionControl, (const uint8_t*)"\x03", 1);
+      break;
+    case TESLA_UDS_IDENT_SESSION:  // session ack; request the pack serial 0xF015
+      if (negative) {
+        ident_requested = false;  // bounded retry; the 0x72A broadcast path still fills these in
+        break;
+      }
+      send_sequence_message(TESLA_UDS_IDENT_SERIAL, SID::ReadDataByIdentifier, (const uint8_t*)"\xF0\x15", 2);
+      break;
+    case TESLA_UDS_IDENT_SERIAL:
+      // 14 ASCII bytes, the same string 0x72A carries across its two muxes.
+      if (!negative && len >= 3 + sizeof(battery_serialNumber) && data[1] == 0xF0 && data[2] == 0x15) {
+        memcpy(battery_serialNumber, data + 3, sizeof(battery_serialNumber));
+        // Must derive the date here too. Setting parsed_battery_serialNumber locks the 0x72A parser
+        // out for the rest of the boot, and this read normally wins the race - so leaving it to the
+        // broadcast meant the date was never computed at all.
+        derive_manufacture_date_from_serial();
+        parsed_battery_serialNumber = true;
+        identity_from_uds = true;
+      }
+      send_sequence_message(TESLA_UDS_IDENT_PACKINFO, SID::ReadDataByIdentifier, (const uint8_t*)"\x04\x50", 2);
+      break;
+    case TESLA_UDS_IDENT_PACKINFO:
+      // PACK_INFO carries BIRTHDATE_EPOCH_TIME, but it never produced a usable date on the bench pack
+      // Response is read for parity/to keep the sequence, but nothing is kept from it currently.
+      send_sequence_message(TESLA_UDS_IDENT_PACK_PN, SID::ReadDataByIdentifier, (const uint8_t*)"\xF0\x14", 2);
+      break;
+    case TESLA_UDS_IDENT_PACK_PN:
+      // PACKAGE_PART_NUMBER is 20 bytes; a Tesla part number is the leading 12 ("1104420-00-F").
+      if (!negative && len >= 15 && data[1] == 0xF0 && data[2] == 0x14) {
+        memcpy(battery_partNumber, data + 3, sizeof(battery_partNumber));
+        parsed_battery_partNumber = true;
+      }
+      send_sequence_message(TESLA_UDS_IDENT_BOARD_PN, SID::ReadDataByIdentifier, (const uint8_t*)"\xF0\x12", 2);
+      break;
+    case TESLA_UDS_IDENT_BOARD_PN:
+      // BOARD_PART_NUMBER on the HVBMS - the BMS board itself, distinct from the pack package above.
+      if (!negative && len >= 15 && data[1] == 0xF0 && data[2] == 0x12) {
+        memcpy(BMS_partNumber, data + 3, sizeof(BMS_partNumber));
+        parsed_BMS_partNumber = true;
+      }
+      // Finish with the PCS board part number (the HVP shares the HVC board, so it is not asked).
+      retarget_uds(PCS_UDS_REQUEST, PCS_UDS_RESPONSE);
+      {
+        uint8_t req[2] = {(uint8_t)(DID_BOARD_PART_NUMBER >> 8), (uint8_t)DID_BOARD_PART_NUMBER};
+        if (!send_sequence_message(TESLA_UDS_IDENT_PCS_PN, SID::ReadDataByIdentifier, req, 2, 3, 1)) {
+          retarget_uds(BMS_UDS_REQUEST, BMS_UDS_RESPONSE);
+        }
+      }
+      break;
+    case TESLA_UDS_IDENT_PCS_PN:
+      // The PCS also broadcasts its part number on 0x3C4; whichever lands first wins.
+      if (!negative && len >= 15 && data[1] == 0xF0 && data[2] == 0x12 && !parsed_PCS_partNumber) {
+        memcpy(PCS_partNumber, data + 3, 12);
+        PCS_partNumber[12] = 0;
+        parsed_PCS_partNumber = true;
+      }
+      retarget_uds(BMS_UDS_REQUEST, BMS_UDS_RESPONSE);
+      break;
+
+    case TESLA_UDS_BLEED:
+      send_sequence_message(TESLA_UDS_BLEED_START, SID::DiagnosticSessionControl, (const uint8_t*)"\x03", 1);
+      break;
+    case TESLA_UDS_BLEED_START:
+      if (negative) {
+        break;
+      }
+      send_sequence_message(TESLA_UDS_BLEED_COUNT, SID::RoutineControl, (const uint8_t*)"\x01\x04\x34", 3);
+      break;
+    case TESLA_UDS_BLEED_COUNT:
+      if (negative || len < 6) {
+        break;
+      }
+      brick_bleed_pack_count = ((uint16_t)data[4] << 8) | data[5];
+      if (brick_bleed_pack_count == 0 || brick_bleed_pack_count > TESLA_MAX_BRICKS) {
+        brick_bleed_pack_count = TESLA_MAX_BRICKS;
+      }
+      request_bleed_results(1);
+      break;
+    case TESLA_UDS_BLEED_RESULT: {
+      if (negative || len < 8) {
+        break;
+      }
+      uint16_t start = ((uint16_t)data[4] << 8) | data[5];
+      uint16_t end = ((uint16_t)data[6] << 8) | data[7];
+      for (uint16_t b = start; b <= end && b <= brick_bleed_pack_count && b <= TESLA_MAX_BRICKS; b++) {
+        uint16_t k = b - start;
+        if ((uint16_t)(8 + k * 4 + 3) >= len) {
+          break;
+        }
+        const uint8_t* p = &data[8 + k * 4];
+        brick_bleed_time_s[b - 1] =
+            ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+      }
+      if (end >= start && end < brick_bleed_pack_count) {
+        request_bleed_results(end + 1);
+      } else {
+        finalize_bleed_read();
+      }
+      break;
+    }
+
+    case TESLA_UDS_CAC_RESET:
+      send_sequence_message(TESLA_UDS_CAC_RESET_ROUTINE, SID::DiagnosticSessionControl, (const uint8_t*)"\x03", 1);
+      break;
+    case TESLA_UDS_CAC_RESET_ROUTINE:
+      if (negative) {
+        set_event(EVENT_CAC_RESET_FAIL, 0);
+        clear_event(EVENT_CAC_RESET_FAIL);
+        break;
+      }
+      start_routine(TESLA_UDS_CAC_RESET_RESULT, RID_RESET_CAC);
+      break;
+    case TESLA_UDS_CAC_RESET_RESULT:
+      if (negative || len < 5 || data[4] != 0x01) {
+        logging.println("CAN UDS: CAC reset rejected");
+        set_event(EVENT_CAC_RESET_FAIL, 0);
+        clear_event(EVENT_CAC_RESET_FAIL);
+        break;
+      }
+      logging.println("CAN UDS: CAC reset accepted");
+      set_event(EVENT_CAC_RESET_SUCCESS, 0);
+      clear_event(EVENT_CAC_RESET_SUCCESS);
+      break;
+
+    case TESLA_UDS_BRICKV:
+      send_sequence_message(TESLA_UDS_BRICKV_READ, SID::DiagnosticSessionControl, (const uint8_t*)"\x03", 1);
+      break;
+    case TESLA_UDS_BRICKV_READ:
+      if (negative) {
+        break;
+      }
+      send_sequence_message(TESLA_UDS_BRICKV_PARSE, SID::ReadDataByIdentifier, (const uint8_t*)"\x04\x10", 2);
+      break;
+    case TESLA_UDS_BRICKV_PARSE: {
+      //62 04 10, then PACK_CURRENT(4) + PACK_VOLTAGE(4), then TESLA_BRICKV_COUNT x u16 big-endian (0.1 mV/bit).
+      if (negative || len < (uint16_t)(3 + 8 + 2 * TESLA_BRICKV_COUNT)) {
+        break;
+      }
+      const uint8_t* v = &data[3 + 8];
+      uint16_t count = 0;
+      for (uint16_t k = 0; k < TESLA_BRICKV_COUNT && k < MAX_AMOUNT_CELLS; k++) {
+        uint16_t mv = (uint16_t)(((uint16_t)v[2 * k] << 8) | v[2 * k + 1]) / 10;
+        if (mv > 500) {  //a real brick is >0.5 V; 0 marks an unused slot on a smaller pack
+          datalayer_battery->status.cell_voltages_mV[k] = mv;
+          count = k + 1;
+        }
+      }
+      if (count > 0) {
+        datalayer_battery->info.number_of_cells = count;
+      }
+      break;
+    }
+
+    case TESLA_UDS_ISO_MON:
+      send_sequence_message(TESLA_UDS_ISO_MON_SESSION, SID::DiagnosticSessionControl, (const uint8_t*)"\x03", 1);
+      break;
+    case TESLA_UDS_ISO_MON_SESSION:
+      if (negative) {
+        break;
+      }
+      {
+        uint8_t seed_req[1] = {SECURITY_LEVEL_5};
+        send_sequence_message(TESLA_UDS_ISO_MON_KEY, SID::SecurityAccess, seed_req, 1);
+      }
+      break;
+    case TESLA_UDS_ISO_MON_KEY:
+      if (negative || !tesla_build_security_key(key, data, len, SECURITY_LEVEL_5 + 1)) {
+        break;
+      }
+      send_sequence_message(TESLA_UDS_ISO_MON_ROUTINE, SID::SecurityAccess, key, 17);
+      break;
+    case TESLA_UDS_ISO_MON_ROUTINE:
+      if (negative) {
+        break;
+      }
+      {
+        uint8_t sub = isolation_monitor_disabling ? RoutineAction::Start : RoutineAction::Stop;
+        uint8_t req[3] = {sub, (uint8_t)(RID_DISABLE_ISOLATION_MONITOR >> 8),
+                          (uint8_t)(RID_DISABLE_ISOLATION_MONITOR & 0xFF)};
+        send_sequence_message(TESLA_UDS_ISO_MON_RESULT, SID::RoutineControl, req, sizeof(req));
+      }
+      break;
+    case TESLA_UDS_ISO_MON_RESULT:
+      if (negative) {
+        logging.println("CAN UDS: isolation monitor request failed");
+        break;
+      }
+      if (!isolation_monitor_disabling) {
+        logging.println("CAN UDS: isolation monitor re-enabled");
+      } else if (len >= 5 && data[4] == 0x00) {
+        logging.println("CAN UDS: isolation monitor disabled");
+      } else {
+        logging.println("CAN UDS: isolation monitor disable rejected");
+      }
+      break;
+
+    case TESLA_UDS_HVC:  // entry
+      if (hvc_bk_phase == HVC_BK_IDLE) {
+        break;  // stale start; nothing to read
+      }
+      hvc_bk_step = 0;
+      if (!hvc_send_current()) {
+        finish_hvc_backup();
+      }
+      break;
+    case TESLA_UDS_HVC_HVBMS:
+    case TESLA_UDS_HVC_HVBMS_CAL:
+    case TESLA_UDS_HVC_HVP:
+    case TESLA_UDS_HVC_CAL_RT:
+      hvc_handle_response(state, sid, data, len);
+      break;
+
+    default:
+      break;
+  }
+}
+
+void TeslaBattery::request_bleed_results(uint16_t start_brick) {
+  uint8_t req[5] = {0x03, 0x04, 0x34, (uint8_t)(start_brick >> 8), (uint8_t)(start_brick & 0xFF)};
+  send_sequence_message(TESLA_UDS_BLEED_RESULT, SID::RoutineControl, req, sizeof(req));
+}
+
+void TeslaBattery::finalize_bleed_read() {
+  uint8_t active = 0;
+  for (uint16_t i = 0; i < brick_bleed_pack_count && i < MAX_AMOUNT_CELLS; i++) {
+    bool bleeding = brick_bleed_has_prev && (brick_bleed_time_s[i] > brick_bleed_prev_s[i]);
+    datalayer_battery->status.cell_balancing_status[i] = bleeding;
+    if (bleeding) {
+      active++;
+    }
+    datalayer_extended.tesla.BMS_brickBleedTime_s[i] = brick_bleed_time_s[i];
+    brick_bleed_prev_s[i] = brick_bleed_time_s[i];
+  }
+  brick_bleed_has_prev = true;
+  datalayer_extended.tesla.BMS_brickCount = brick_bleed_pack_count;
+  datalayer_extended.tesla.BMS_brickBleedActiveCount = active;
+  datalayer_extended.tesla.BMS_brickBleedValid = true;
+}
+
+void TeslaBattery::on_uds_sequence_timeout(uint16_t state) {
+  if (state >= TESLA_UDS_BMS_RESET && state <= TESLA_UDS_BMS_RESET_DONE) {
+    set_event(EVENT_BMS_RESET_REQ_FAIL, 0);
+    clear_event(EVENT_BMS_RESET_REQ_FAIL);
+  } else if (state >= TESLA_UDS_SOC_RESET && state <= TESLA_UDS_SOC_RESET_DONE) {
+    set_event(EVENT_BATTERY_SOC_RESET_FAIL, 0, battery_index);
+    clear_event(EVENT_BATTERY_SOC_RESET_FAIL, battery_index);
+  } else if (state >= TESLA_UDS_BRICKV && state <= TESLA_UDS_BRICKV_PARSE) {
+    brickv_requested = false;  //allow a bounded retry; 0x401 remains the fallback
+  } else if (state >= TESLA_UDS_VERSION && state <= TESLA_UDS_VERSION_PCS_F012) {
+    ecu_version_continue(state);  //an ECU may be absent; move the chain on
+  } else if (state >= TESLA_UDS_IDENT && state <= TESLA_UDS_IDENT_BOARD_PN) {
+    ident_requested = false;  //allow a bounded retry; the 0x72A / 0x3C4 broadcasts remain the fallback
+  } else if (state == TESLA_UDS_IDENT_PCS_PN) {
+    retarget_uds(BMS_UDS_REQUEST, BMS_UDS_RESPONSE);  //PCS silent; the 0x3C4 broadcast remains the fallback
+  } else if (state >= TESLA_UDS_HVC && state <= TESLA_UDS_HVC_CAL_RT) {
+    hvc_handle_response(state, 0, nullptr, 0);
+  } else if (state >= TESLA_UDS_CBC && state <= TESLA_UDS_CBC_DONE) {
+    // The HVBMS ECUReset can reboot the ECU without answering; if we time out at that step, still
+    // queue the HVP reset so the attempt completes. Earlier steps timing out are a genuine failure.
+    if (state == TESLA_UDS_CBC_HVBMS) {
+      pending_ecu_reset_req_id = HVP_UDS_REQUEST;
+    } else {
+      set_event(EVENT_CLEAR_BLOCKED_CONTACTORS_FAIL, 0);
+      clear_event(EVENT_CLEAR_BLOCKED_CONTACTORS_FAIL);
+    }
+  }
+}
+
+// ---- ECU firmware-version fingerprint ------------------------------------------------------------
+
+static void ver_append_token(char* buf, size_t cap, size_t& pos, const char* key, const char* did,
+                             const uint8_t* bytes, uint8_t n) {
+  if (n == 0 || pos >= cap) {
+    return;
+  }
+  int w = snprintf(buf + pos, cap - pos, ";%s:%s=", key, did);
+  if (w < 0 || (size_t)w >= cap - pos) {
+    return;
+  }
+  pos += (size_t)w;
+  static const char* hexchars = "0123456789abcdef";
+  for (uint8_t i = 0; i < n && pos + 2 < cap; i++) {
+    buf[pos++] = hexchars[bytes[i] >> 4];
+    buf[pos++] = hexchars[bytes[i] & 0x0F];
+  }
+  buf[pos] = '\0';
+}
+
+void TeslaBattery::start_ecu_version_query() {
+  ecu_version_query_requested = false;
+  ecu_ver_bms = EcuVersion();
+  ecu_ver_hvp = EcuVersion();
+  ecu_ver_pcs = EcuVersion();
+  datalayer_extended.tesla.ecu_version_query_state = 1;  // querying
+  datalayer_extended.tesla.ecu_version_fingerprint[0] = '\0';
+  if (!start_sequence(TESLA_UDS_VERSION)) {
+    finish_ecu_version_query();  // channel busy despite the guard; report the empty result
+  }
+}
+
+void TeslaBattery::ecu_version_store_did(EcuVersion& ev, const uint8_t* data, uint16_t len) {
+  if (len < 3 || data[0] != 0x62) {
+    return;  // session acks and negative responses store nothing
+  }
+  uint16_t did = (uint16_t)((data[1] << 8) | data[2]);
+  const uint8_t* val = data + 3;
+  uint16_t vlen = (uint16_t)(len - 3);
+  if (did == DID_BOOT_SW_ID) {
+    uint8_t n = (uint8_t)(vlen > sizeof(ev.f180) ? sizeof(ev.f180) : vlen);
+    memcpy(ev.f180, val, n);
+    ev.f180_len = n;
+  } else if (did == DID_APP_CRC && vlen >= 4) {
+    memcpy(ev.crc0f00, val, 4);
+    ev.crc0f00_valid = true;
+  } else if (did == DID_APP_CRC_CPU2 && vlen >= 4) {
+    memcpy(ev.crc0f02, val, 4);
+    ev.crc0f02_valid = true;
+  } else if (did == DID_BOARD_PART_NUMBER && vlen >= 12 && !parsed_PCS_partNumber) {
+    // Only the PCS is asked for 0xF012 here; the 0x3C4 broadcast may already have supplied it.
+    memcpy(PCS_partNumber, val, 12);
+    PCS_partNumber[12] = 0;
+    parsed_PCS_partNumber = true;
+  }
+}
+
+bool TeslaBattery::ecu_ver_send(uint16_t next_state, uint16_t did) {
+  uint8_t req[2] = {(uint8_t)(did >> 8), (uint8_t)did};
+  return send_sequence_message(next_state, SID::ReadDataByIdentifier, req, 2, 3, 1);
+}
+
+// Send the read that follows `state` in the BMS -> HVP -> PCS chain. Reached from both the
+// response and the timeout path, so an absent ECU cannot stall the query.
+void TeslaBattery::ecu_version_continue(uint16_t state) {
+  uint16_t next = 0, did = 0;
+  switch (state) {
+    case TESLA_UDS_VERSION_SESSION:
+      next = TESLA_UDS_VERSION_F180;
+      did = DID_BOOT_SW_ID;
+      break;
+    case TESLA_UDS_VERSION_F180:
+      next = TESLA_UDS_VERSION_0F00;
+      did = DID_APP_CRC;
+      break;
+    case TESLA_UDS_VERSION_0F00:
+      retarget_uds(HVP_UDS_REQUEST, HVP_UDS_RESPONSE);
+      next = TESLA_UDS_VERSION_HVP_F180;
+      did = DID_BOOT_SW_ID;
+      break;
+    case TESLA_UDS_VERSION_HVP_F180:
+      next = TESLA_UDS_VERSION_HVP_0F00;
+      did = DID_APP_CRC;
+      break;
+    case TESLA_UDS_VERSION_HVP_0F00:
+      retarget_uds(PCS_UDS_REQUEST, PCS_UDS_RESPONSE);
+      next = TESLA_UDS_VERSION_PCS_F180;
+      did = DID_BOOT_SW_ID;
+      break;
+    case TESLA_UDS_VERSION_PCS_F180:
+      next = TESLA_UDS_VERSION_PCS_0F00;
+      did = DID_APP_CRC;
+      break;
+    case TESLA_UDS_VERSION_PCS_0F00:
+      next = TESLA_UDS_VERSION_PCS_0F02;
+      did = DID_APP_CRC_CPU2;
+      break;
+    case TESLA_UDS_VERSION_PCS_0F02:
+      next = TESLA_UDS_VERSION_PCS_F012;
+      did = DID_BOARD_PART_NUMBER;
+      break;
+    case TESLA_UDS_VERSION_PCS_F012:
+    default:
+      finish_ecu_version_query();
+      return;
+  }
+  if (!ecu_ver_send(next, did)) {
+    finish_ecu_version_query();
+  }
+}
+
+void TeslaBattery::finish_ecu_version_query() {
+  retarget_uds(BMS_UDS_REQUEST, BMS_UDS_RESPONSE);
+  char* fp = datalayer_extended.tesla.ecu_version_fingerprint;
+  size_t cap = sizeof(datalayer_extended.tesla.ecu_version_fingerprint);
+  int w = snprintf(fp, cap, "TESLAVER1");
+  size_t pos = (w > 0) ? (size_t)w : 0;
+  ver_append_token(fp, cap, pos, "hvbms", "F180", ecu_ver_bms.f180, ecu_ver_bms.f180_len);
+  if (ecu_ver_bms.crc0f00_valid) {
+    ver_append_token(fp, cap, pos, "hvbms", "0F00", ecu_ver_bms.crc0f00, 4);
+  }
+  ver_append_token(fp, cap, pos, "hvp", "F180", ecu_ver_hvp.f180, ecu_ver_hvp.f180_len);
+  if (ecu_ver_hvp.crc0f00_valid) {
+    ver_append_token(fp, cap, pos, "hvp", "0F00", ecu_ver_hvp.crc0f00, 4);
+  }
+  ver_append_token(fp, cap, pos, "pcs", "F180", ecu_ver_pcs.f180, ecu_ver_pcs.f180_len);
+  if (ecu_ver_pcs.crc0f00_valid) {
+    ver_append_token(fp, cap, pos, "pcs", "0F00", ecu_ver_pcs.crc0f00, 4);
+  }
+  if (ecu_ver_pcs.crc0f02_valid) {
+    ver_append_token(fp, cap, pos, "pcs", "0F02", ecu_ver_pcs.crc0f02, 4);
+  }
+  datalayer_extended.tesla.ecu_version_query_state = 2;  // complete
+}
+
+// Characters 4-5 of the serial are the build year, 6-8 the Julian day: "TG322221000ZD4" is day 221
+// of 2022. Both the 0x72A broadcast and the UDS 0xF015 read produce the same 14 characters, so the
+// date is derived here rather than in either parser.
+void TeslaBattery::derive_manufacture_date_from_serial() {
+  char yearStr[5];  // Full year string (including the "20" prefix)
+  snprintf(yearStr, sizeof(yearStr), "20%c%c", battery_serialNumber[3], battery_serialNumber[4]);
+  int year = atoi(yearStr);
+  char dayStr[4];
+  snprintf(dayStr, sizeof(dayStr), "%c%c%c", battery_serialNumber[5], battery_serialNumber[6],
+           battery_serialNumber[7]);
+  int day = atoi(dayStr);
+  battery_manufactureDate = dayOfYearToDate(year, day);
+}
+
+// One-shot pack identity read at startup: pack serial, part numbers and PACK_INFO off the HVBMS,
+// ending with the PCS board part number. Everything is security_level 0, so an extended
+// session is enough - nothing written, no contactor movement.
+void TeslaBattery::start_identity_query() {
+  start_sequence(TESLA_UDS_IDENT);
+}
+
+//UDS ECUReset, hardReset with suppressed positive response (0x11 0x81), byte-for-byte the reboot
+//ODIN issues after flashing. Accepted in the default session; no response to wait for.
+void TeslaBattery::send_ecu_reset(uint16_t req_id) {
+  CAN_frame f = {};
+  f.FD = false;
+  f.ext_ID = false;
+  f.DLC = 8;
+  f.ID = req_id;
+  f.data.u8[0] = 0x02;  // ISO-TP single frame, 2 payload bytes
+  f.data.u8[1] = 0x11;  // ECUReset
+  f.data.u8[2] = 0x81;  // hardReset (0x01) + suppressPositiveResponse (0x80), matches ODIN
+  f.data.u8[3] = 0x55;  // Tesla request padding
+  f.data.u8[4] = 0x55;
+  f.data.u8[5] = 0x55;
+  f.data.u8[6] = 0x55;
+  f.data.u8[7] = 0x55;
+  transmit_can_frame(&f);
+}
+
+// HVC backup engine
+namespace {
+enum HvcScalarTag : uint8_t {
+  TAG_ENERGY, TAG_PACK_INFO, TAG_HIST_COUNT, TAG_ASM_HVBMS, TAG_USE_HVBMS, TAG_CFG_HVBMS,
+  TAG_PKG_PN, TAG_PKG_SN, TAG_BOARD_PN, TAG_BOARD_SN, TAG_ASM_HVP, TAG_USE_HVP, TAG_CFG_HVP,
+  TAG_HVP_CAL,
+};
+// min_len is the shortest response that still decodes without inventing data; shorter positive
+// replies are left MISSING (rather that than incorrect data in a restore backup). ASCII fields
+// use 1, since packs answer them shorter than the declared length. ENERGY_COUNTERS is 28, not the
+// ODX's 32: 2022 packs send the Ah pair as two uint16 and stop there, and ODIN's own clone backup
+// declares 28 too - the length picks the layout at decode time.
+struct HvcScalar {
+  uint16_t did;
+  uint8_t tag;
+  uint8_t min_len;
+};
+const HvcScalar HVC_SCALARS[] = {
+    {0x0420, TAG_ENERGY, 28},   {0x0450, TAG_PACK_INFO, 10}, {0x0436, TAG_HIST_COUNT, 8},
+    {0xF01C, TAG_ASM_HVBMS, 1}, {0xF01D, TAG_USE_HVBMS, 2},  {0x0439, TAG_CFG_HVBMS, 64},
+    {0xF014, TAG_PKG_PN, 1},    {0xF015, TAG_PKG_SN, 1},     {0xF012, TAG_BOARD_PN, 1},
+    {0xF013, TAG_BOARD_SN, 1},
+};
+// Calibration records are read via the CALIBRATION_RECORD routine getResults (HVP 0x438, HVBMS
+// 0x439) with a one-byte record id; the 0x0500+id DIDs are kept as an HVP fallback. HVBMS ids
+// 0/1/6 are the required-for-recovery set.
+constexpr uint16_t HVP_CAL_DID_BASE = 0x0500;
+constexpr uint16_t RT_HVP_CAL = 0x0438;
+constexpr uint16_t RT_HVBMS_CAL = 0x0439;  // routine, distinct from the 0x0439 CONFIGURATION_RECORD DID
+constexpr uint8_t HVBMS_CAL_IDS[TESLA_HVBMS_NUM_CAL] = {0, 1, 6};
+const HvcScalar HVC_SCALARS_HVP[] = {
+    {0xF01C, TAG_ASM_HVP, 1}, {0xF01D, TAG_USE_HVP, 2}, {0x0439, TAG_CFG_HVP, 64},
+    {0x0500, TAG_HVP_CAL, 4}, {0x0501, TAG_HVP_CAL, 4}, {0x0502, TAG_HVP_CAL, 4},
+    {0x0503, TAG_HVP_CAL, 4}, {0x0504, TAG_HVP_CAL, 4}, {0x0505, TAG_HVP_CAL, 4},
+    {0x0506, TAG_HVP_CAL, 4}, {0x0507, TAG_HVP_CAL, 4},
+};
+constexpr uint8_t N_HVC_SCALARS = sizeof(HVC_SCALARS) / sizeof(HVC_SCALARS[0]);
+constexpr uint8_t N_HVC_SCALARS_HVP = sizeof(HVC_SCALARS_HVP) / sizeof(HVC_SCALARS_HVP[0]);
+constexpr uint16_t HVC_STEP_TIMEOUT_TICKS = 3;  // per attempt, in the framework's 100ms ticks
+constexpr uint8_t HVC_STEP_RETRIES = 2;
+uint32_t rd_be32(const uint8_t* p) {
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+uint16_t rd_be16(const uint8_t* p) {
+  return (uint16_t)((p[0] << 8) | p[1]);
+}
+}  // namespace
+
+bool TeslaBattery::start_hvc_backup() {
+  if (hvc_bk_phase != HVC_BK_IDLE) {
+    return false;
+  }
+  // A silent pack would just time every read out, with no way to tell a refusal from absence.
+  if (datalayer_battery->status.CAN_battery_still_alive == 0) {
+    logging.println("INFO: HVC backup refused - battery is not responding on CAN");
+    return false;
+  }
+  // The backup may hold 0x221 in ACCESSORY, which is not something to do during a fault or stop.
+  if (datalayer.system.status.system_status == FAULT || datalayer.system.info.equipment_stop_active) {
+    logging.println("INFO: HVC backup refused - emulator faulted or equipment stop active");
+    return false;
+  }
+  if (!hvc_backup) {
+    hvc_backup = new TeslaHvcBackup();
+    if (!hvc_backup) {
+      logging.println("INFO: HVC backup refused - out of memory");
+      return false;
+    }
+  }
+  // Queue the sequence now if the framework's slot is free; otherwise transmit_can keeps trying,
+  // so a backup asked for while another sequence occupies the channel waits instead of refusing.
+  hvc_bk_queued = start_sequence(TESLA_UDS_HVC);
+  // If the pack is on its way down (emulator paused, 0x221 walking to OFF), hold ACCESSORY for the
+  // run and put the mode back afterwards. The contactors are left alone, as ODIN does.
+  if (!hvc_bk_accessory_held && (vehicleState == GOING_DOWN || vehicleState == CAR_OFF)) {
+    hvc_bk_saved_accessory_forced = accessory_mode_forced;
+    hvc_bk_saved_balance_at_rest = balance_at_rest_enabled;
+    hvc_bk_accessory_held = true;
+    balance_at_rest_enabled = false;  // it would flip the mode back out from under us
+    accessory_mode_forced = true;
+    logging.println("INFO: HVC backup holding ACCESSORY to keep the pack awake");
+  }
+  *hvc_backup = TeslaHvcBackup{};
+  hvc_backup_ready = false;
+  hvc_backup_refused = false;
+  hvc_bk_reads_total = 0;
+  hvc_bk_reads_ok = 0;
+  hvc_bk_phase = HVC_BK_HVBMS;
+  hvc_bk_step = 0;
+  return true;
+}
+
+// Undo the ACCESSORY hold the backup took, if it took one. Called however the run ends.
+void TeslaBattery::release_hvc_backup_hold() {
+  if (!hvc_bk_accessory_held) {
+    return;
+  }
+  hvc_bk_accessory_held = false;
+  accessory_mode_forced = hvc_bk_saved_accessory_forced;
+  balance_at_rest_enabled = hvc_bk_saved_balance_at_rest;
+  logging.println("INFO: HVC backup released the ACCESSORY hold");
+}
+
+bool TeslaBattery::hvc_send_current() {
+  if (hvc_bk_phase == HVC_BK_HVBMS_CAL) {
+    uint8_t req[4] = {0x03, (uint8_t)(RT_HVBMS_CAL >> 8), (uint8_t)RT_HVBMS_CAL, HVBMS_CAL_IDS[hvc_bk_step]};
+    return send_sequence_message(TESLA_UDS_HVC_HVBMS_CAL, SID::RoutineControl, req, 4,
+                                 HVC_STEP_TIMEOUT_TICKS, HVC_STEP_RETRIES);
+  }
+  const HvcScalar& sc =
+      (hvc_bk_phase == HVC_BK_HVBMS) ? HVC_SCALARS[hvc_bk_step] : HVC_SCALARS_HVP[hvc_bk_step];
+  if (hvc_bk_phase == HVC_BK_HVP && sc.tag == TAG_HVP_CAL) {
+    uint8_t rec = (uint8_t)(sc.did - HVP_CAL_DID_BASE);
+    uint8_t req[4] = {0x03, (uint8_t)(RT_HVP_CAL >> 8), (uint8_t)RT_HVP_CAL, rec};
+    return send_sequence_message(TESLA_UDS_HVC_CAL_RT, SID::RoutineControl, req, 4,
+                                 HVC_STEP_TIMEOUT_TICKS, HVC_STEP_RETRIES);
+  }
+  uint16_t state = (hvc_bk_phase == HVC_BK_HVBMS) ? TESLA_UDS_HVC_HVBMS : TESLA_UDS_HVC_HVP;
+  uint8_t req[2] = {(uint8_t)(sc.did >> 8), (uint8_t)sc.did};
+  return send_sequence_message(state, SID::ReadDataByIdentifier, req, 2, HVC_STEP_TIMEOUT_TICKS,
+                               HVC_STEP_RETRIES);
+}
+
+void TeslaBattery::hvc_handle_response(uint16_t state, uint8_t sid, const uint8_t* data, uint16_t len) {
+  if (!hvc_backup || hvc_bk_phase == HVC_BK_IDLE) {
+    return;
+  }
+  const bool negative = (sid == kNegativeResponseSid);
+
+  // HVBMS calibration record: 71 03 04 39 <uint32>. No DID exists, so a refusal is final.
+  if (state == TESLA_UDS_HVC_HVBMS_CAL) {
+    bool stored = false;
+    if (data != nullptr && !negative && len >= 8 && data[0] == 0x71) {
+      hvc_backup->hvbms_cal[hvc_bk_step] = rd_be32(data + 4);
+      hvc_backup->hvbms_cal_present[hvc_bk_step] = true;
+      stored = true;
+    } else if (negative) {
+      hvc_backup->record_nrc(RT_HVBMS_CAL, len >= 3 ? data[2] : 0);
+    }
+    hvc_score_and_advance(stored);
+    return;
+  }
+
+  bool stored = false;
+  if (data != nullptr && !negative) {
+    stored = hvc_store_scalar(data, len, state == TESLA_UDS_HVC_CAL_RT);
+  } else if (negative) {
+    const HvcScalar& sc =
+        (state == TESLA_UDS_HVC_HVBMS) ? HVC_SCALARS[hvc_bk_step] : HVC_SCALARS_HVP[hvc_bk_step];
+    hvc_backup->record_nrc(state == TESLA_UDS_HVC_CAL_RT ? RT_HVP_CAL : sc.did,
+                           len >= 3 ? data[2] : 0);
+  }
+  // An HVP calibration record whose routine read failed gets one more try as the 0x0500+id DID
+  // before it is scored - the fallback is a second attempt at the same record, not a separate read.
+  if (!stored && state == TESLA_UDS_HVC_CAL_RT) {
+    const HvcScalar& sc = HVC_SCALARS_HVP[hvc_bk_step];
+    uint8_t req[2] = {(uint8_t)(sc.did >> 8), (uint8_t)sc.did};
+    if (send_sequence_message(TESLA_UDS_HVC_HVP, SID::ReadDataByIdentifier, req, 2,
+                              HVC_STEP_TIMEOUT_TICKS, HVC_STEP_RETRIES)) {
+      return;
+    }
+  }
+  hvc_score_and_advance(stored);
+}
+
+bool TeslaBattery::hvc_store_scalar(const uint8_t* rx, uint16_t len, bool via_routine) {
+  TeslaHvcBackup& b = *hvc_backup;
+  const HvcScalar& sc =
+      (hvc_bk_phase == HVC_BK_HVBMS) ? HVC_SCALARS[hvc_bk_step] : HVC_SCALARS_HVP[hvc_bk_step];
+  const uint8_t* data = nullptr;
+  uint16_t dlen = 0;
+  if (!via_routine && len >= 3 && rx[0] == 0x62) {  // 62 did_hi did_lo <data>
+    data = rx + 3;
+    dlen = (uint16_t)(len - 3);
+  } else if (via_routine && len >= 4 && rx[0] == 0x71) {  // 71 sub rid_hi rid_lo <data>
+    data = rx + 4;
+    dlen = (uint16_t)(len - 4);
+  } else {
+    return false;
+  }
+  if (dlen < sc.min_len) {
+    if (!b.short_read_count) {
+      b.short_read_did = sc.did;
+      b.short_read_len = (uint8_t)(dlen > 255 ? 255 : dlen);
+    }
+    ++b.short_read_count;
+    return false;
+  }
+  auto copy_ascii = [&](char* dst, uint8_t cap) {
+    uint16_t k = 0;
+    for (; k < dlen && k < (uint16_t)(cap - 1) && data[k]; k++) {
+      dst[k] = (char)data[k];
+    }
+    dst[k] = 0;
+  };
+  switch (sc.tag) {
+    case TAG_ENERGY: {
+      uint8_t n_ec = (uint8_t)(dlen < 32 ? dlen : 32);
+      memset(b.energy_counters, 0, sizeof(b.energy_counters));  // a 28-byte reply leaves no tail
+      memcpy(b.energy_counters, data, n_ec);
+      b.energy_counters_len = n_ec;
+      b.energy_counters_present = true;
+      break;
+    }
+    case TAG_PACK_INFO:
+      memcpy(b.pack_info, data, dlen < 16 ? dlen : 16);
+      b.pack_info_present = true;
+      b.num_modules = data[1];
+      b.num_bricks = data[3];
+      break;
+    case TAG_HIST_COUNT:
+      memcpy(b.hist_page_count, data, dlen < 8 ? dlen : 8);
+      b.hist_page_count_present = true;
+      break;
+    case TAG_ASM_HVBMS:
+      b.assembly_id_hvbms = data[0];
+      b.assembly_id_hvbms_present = true;
+      break;
+    case TAG_USE_HVBMS:
+      b.usage_id_hvbms = rd_be16(data);
+      b.usage_id_hvbms_present = true;
+      break;
+    case TAG_CFG_HVBMS:
+      b.config_hvbms_len = (uint8_t)(dlen < 64 ? dlen : 64);
+      memcpy(b.config_hvbms, data, b.config_hvbms_len);
+      break;
+    case TAG_PKG_PN:
+      copy_ascii(b.package_pn, sizeof(b.package_pn));
+      b.package_pn_present = true;
+      break;
+    case TAG_PKG_SN:
+      copy_ascii(b.package_sn, sizeof(b.package_sn));
+      b.package_sn_present = true;
+      break;
+    case TAG_BOARD_PN:
+      copy_ascii(b.board_pn, sizeof(b.board_pn));
+      b.board_pn_present = true;
+      break;
+    case TAG_BOARD_SN:
+      copy_ascii(b.board_sn, sizeof(b.board_sn));
+      b.board_sn_present = true;
+      break;
+    case TAG_ASM_HVP:
+      b.assembly_id_hvp = data[0];
+      b.assembly_id_hvp_present = true;
+      break;
+    case TAG_USE_HVP:
+      b.usage_id_hvp = rd_be16(data);
+      b.usage_id_hvp_present = true;
+      break;
+    case TAG_CFG_HVP:
+      b.config_hvp_len = (uint8_t)(dlen < 64 ? dlen : 64);
+      memcpy(b.config_hvp, data, b.config_hvp_len);
+      break;
+    case TAG_HVP_CAL: {
+      uint8_t idx = (uint8_t)(HVC_SCALARS_HVP[hvc_bk_step].did - HVP_CAL_DID_BASE);
+      if (idx >= TESLA_HVP_NUM_CAL) {
+        return false;
+      }
+      b.hvp_cal[idx] = rd_be32(data);
+      b.hvp_cal_present[idx] = true;
+      b.hvp_cal_from_did[idx] = !via_routine;
+      break;
+    }
+  }
+  return true;
+}
+
+void TeslaBattery::hvc_score_and_advance(bool stored) {
+  ++hvc_bk_reads_total;
+  if (stored) {
+    ++hvc_bk_reads_ok;
+  }
+  ++hvc_bk_step;
+  if (hvc_bk_phase == HVC_BK_HVBMS && hvc_bk_step >= N_HVC_SCALARS) {
+    hvc_bk_phase = HVC_BK_HVBMS_CAL;
+    hvc_bk_step = 0;
+  } else if (hvc_bk_phase == HVC_BK_HVBMS_CAL && hvc_bk_step >= TESLA_HVBMS_NUM_CAL) {
+    hvc_bk_phase = HVC_BK_HVP;
+    hvc_bk_step = 0;
+    retarget_uds(HVP_UDS_REQUEST, HVP_UDS_RESPONSE);
+  } else if (hvc_bk_phase == HVC_BK_HVP && hvc_bk_step >= N_HVC_SCALARS_HVP) {
+    finish_hvc_backup();
+    return;
+  }
+  if (!hvc_send_current()) {
+    finish_hvc_backup();  // channel taken away mid-run; keep what was read
+  }
+}
+
+void TeslaBattery::finish_hvc_backup() {
+  retarget_uds(BMS_UDS_REQUEST, BMS_UDS_RESPONSE);
+  hvc_bk_phase = HVC_BK_IDLE;
+  hvc_bk_queued = false;
+  hvc_backup_ready = true;
+  ++hvc_bk_runs;
+  release_hvc_backup_hold();
+  logging.printf("INFO: HVC backup complete, %u of %u reads answered\n", (unsigned)hvc_bk_reads_ok,
+                 (unsigned)hvc_bk_reads_total);
+}
+
+String TeslaBattery::hvc_backup_json() {
+  if (hvc_backup && hvc_backup_ready) {
+    return build_hvc_backup_json(*hvc_backup);
+  }
+  return String("{\"error\": \"no backup available\"}");
+}
+
+// The pack serial the backup itself carries (0xF015). Restricted to the characters a Tesla serial
+// actually uses: this string arrives over CAN and ends up in a Content-Disposition header.
+String TeslaBattery::hvc_backup_name() {
+  if (!hvc_backup || !hvc_backup_ready || !hvc_backup->package_sn_present) {
+    return String("");
+  }
+  char name[sizeof(hvc_backup->package_sn)] = {0};
+  uint8_t k = 0;
+  for (const char* p = hvc_backup->package_sn; *p && k < (uint8_t)(sizeof(name) - 1); p++) {
+    char c = *p;
+    bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+    if (safe) {
+      name[k++] = c;
+    }
+  }
+  return String(name);
+}
+
+String TeslaBattery::hvc_backup_status_json() {
+  const char* state = "idle";
+  const char* phase = "";
+  if (hvc_bk_phase != HVC_BK_IDLE) {
+    state = "running";
+    phase = (hvc_bk_phase == HVC_BK_HVBMS)       ? "HVBMS identity and counters"
+            : (hvc_bk_phase == HVC_BK_HVBMS_CAL) ? "HVBMS calibration"
+                                                 : "HVP identity and calibration";
+  } else if (hvc_backup_refused) {
+    state = "refused";
+    phase = "Pack not readable - check it is on CAN and the emulator is not faulted or stopped";
+  } else if (hvc_backup_ready) {
+    state = "ready";
+  }
+  String json = "{\"state\":\"";
+  json += state;
+  json += "\",\"phase\":\"";
+  json += phase;
+  json += "\",\"ok\":";
+  json += String(hvc_bk_reads_ok);
+  json += ",\"reads\":";
+  json += String(hvc_bk_reads_total);
+  json += ",\"run\":";
+  json += String(hvc_bk_runs);
+  json += ",\"note\":\"\"}";
+  return json;
+}
+
+
 void TeslaBattery::setup(void) {  // Performs one time setup at startup
+
+  setup_uds(0x602, 0x612);
 
   if (allows_contactor_closing) {
     *allows_contactor_closing = true;
   }
 
   //0x7FF GTW CAN frame values
-  //Mux1
-  write_signal_value(&TESLA_7FF_Mux1, 16, 16, user_selected_tesla_GTW_country, false);
-  write_signal_value(&TESLA_7FF_Mux1, 11, 1, user_selected_tesla_GTW_rightHandDrive, false);
-  //Mux3
-  write_signal_value(&TESLA_7FF_Mux3, 8, 4, user_selected_tesla_GTW_mapRegion, false);
-  write_signal_value(&TESLA_7FF_Mux3, 18, 3, user_selected_tesla_GTW_chassisType, false);
+  //Mux1 (country, RHD) is now fixed.
+  //Mux2: GTW_numberHVILNodes, VAL_ 2047 0 "HVIL_NODES_0" 2 "HVIL_NODES_2" 3 "HVIL_NODES_3" (never 1).
+  //0 is different: user_selected_tesla_digital_HVIL
+  const bool tesla_3Y_long_range = (user_selected_battery_type == BatteryType::TeslaModel3Y) &&
+                                   (user_selected_tesla_GTW_packEnergy == TESLA_GTW_PACK_ENERGY_LR);
+  write_signal_value(&TESLA_7FF_Mux2, 62, 2, tesla_3Y_long_range ? 3 : 2, false);
+  //Mux3: mapRegion is fixed; chassisType follows the selected battery:
+  //2 = Model 3 for 3/Y packs, 0 = Model S for S/X packs. The BMS does not mind which exact
+  //car the pack came from, so the per-family value is enough.
+  const uint16_t tesla_GTW_chassisType = (user_selected_battery_type == BatteryType::TeslaModel3Y) ? 2 : 0;
+  write_signal_value(&TESLA_7FF_Mux3, 18, 3, tesla_GTW_chassisType, false);
   write_signal_value(&TESLA_7FF_Mux3, 32, 5, user_selected_tesla_GTW_packEnergy, false);
 
   switch (
@@ -3070,4 +4051,251 @@ void TeslaBattery::setup(void) {  // Performs one time setup at startup
     datalayer_battery->info.min_cell_voltage_mV = MIN_CELL_VOLTAGE_NCA_NCM;
     datalayer_battery->info.max_cell_voltage_deviation_mV = MAX_CELL_DEVIATION_NCA_NCM;
   }
+}
+
+// HVC backup JSON builder
+// Reproduces Tesla/ODIN's HVC_backup.json (field order, names, encodings). The statistics a
+// partial backup does not read (module life, brick SOC/CAC/bleed, histograms) render as MISSING
+// so a restore tool still finds every block it looks up by name.
+namespace {
+
+uint32_t hvc_be32(const uint8_t* p) {
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+uint16_t hvc_be16(const uint8_t* p) {
+  return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
+
+// "<int>.<frac>" with trailing zeros trimmed, like Python's repr of raw*10^-places.
+String hvc_scaled(uint32_t whole, uint16_t frac, int places) {
+  char buf[32];
+  int n = snprintf(buf, sizeof(buf), "%u", (unsigned)whole);
+  if (frac) {
+    char fb[8];
+    if (places == 3) {
+      snprintf(fb, sizeof(fb), "%03u", (unsigned)frac);
+    } else {
+      snprintf(fb, sizeof(fb), "%02u", (unsigned)frac);
+    }
+    int fl = (int)strlen(fb);
+    while (fl > 1 && fb[fl - 1] == '0') {
+      fb[--fl] = '\0';
+    }
+    n += snprintf(buf + n, sizeof(buf) - n, ".%s", fb);
+  }
+  return String(buf);
+}
+String hvc_kwh(uint32_t raw) {  // ODIN emits kWh as raw*0.001
+  return hvc_scaled(raw / 1000, (uint16_t)(raw % 1000), 3);
+}
+String hvc_hexstr(const uint8_t* p, uint16_t n) {
+  String s;
+  s.reserve(n * 2);
+  static const char* H = "0123456789abcdef";
+  char pair[3] = {0, 0, 0};
+  for (uint16_t i = 0; i < n; i++) {
+    pair[0] = H[p[i] >> 4];
+    pair[1] = H[p[i] & 0x0F];
+    s += pair;
+  }
+  return s;
+}
+// One table row: ["Name", value]. jsonValue is emitted verbatim (number, or quoted string).
+void hvc_row(String& out, bool& first, const char* name, const String& jsonValue) {
+  if (!first) {
+    out += ",\n";
+  }
+  first = false;
+  out += "          [\n            \"";
+  out += name;
+  out += "\",\n            ";
+  out += jsonValue;
+  out += "\n          ]";
+}
+String hvc_q(const String& s) {
+  return "\"" + s + "\"";
+}
+String hvc_q(const char* s) {
+  return String("\"") + s + "\"";
+}
+
+}  // namespace
+
+String build_hvc_backup_json(const TeslaHvcBackup& b) {
+  const char* MISSING = "\"MISSING\"";
+  String out;
+  out.reserve(8192);
+  out += "{\n  \"data\": [\n";
+
+  // ---- block 0: HVBMS Data table ----
+  out += "    {\n      \"data\": {\n        \"headers\": [\n          \"Name\",\n          \"Data\"\n"
+         "        ],\n        \"rows\": [\n";
+  bool first = true;
+  const uint8_t* e = b.energy_counters;
+  bool ec = b.energy_counters_present;
+  hvc_row(out, first, "Discharge Total kWh", ec ? hvc_kwh(hvc_be32(e + 0)) : String(MISSING));
+  hvc_row(out, first, "Drive Discharge kWh", ec ? hvc_kwh(hvc_be32(e + 4)) : String(MISSING));
+  hvc_row(out, first, "Charge Total kWh", ec ? hvc_kwh(hvc_be32(e + 8)) : String(MISSING));
+  hvc_row(out, first, "AC Charge kWh", ec ? hvc_kwh(hvc_be32(e + 12)) : String(MISSING));
+  hvc_row(out, first, "DC Charge kWh", ec ? hvc_kwh(hvc_be32(e + 16)) : String(MISSING));
+  hvc_row(out, first, "Regen Charge kWh", ec ? hvc_kwh(hvc_be32(e + 20)) : String(MISSING));
+  // DISCHARGE_AH / CHARGE_AH: the ODX types both as uint32 at bytes 24/28, but some packs send two
+  // uint16 at 24/26 and end the response there. A response under 32 bytes is the narrow layout;
+  // the value test catches a full-length response that is nonetheless packed narrow.
+  bool narrow = b.energy_counters_len && b.energy_counters_len < 32;
+  uint32_t dis_ah = hvc_be32(e + 24), chg_ah = hvc_be32(e + 28);
+  if (narrow || ((dis_ah >> 16) != 0 && chg_ah == 0)) {
+    dis_ah = (uint32_t)hvc_be16(e + 24);
+    chg_ah = (uint32_t)hvc_be16(e + 26);
+  }
+  hvc_row(out, first, "Discharge Ah", ec ? String(dis_ah) : String(MISSING));
+  hvc_row(out, first, "Charge Ah", ec ? String(chg_ah) : String(MISSING));
+
+  // Module life data is not read by a partial backup.
+  for (uint8_t m = 0; m < b.num_modules && m < TESLA_HVC_MAX_MODULES; m++) {
+    String p = "Module " + String(m + 1) + " ";
+    hvc_row(out, first, (p + "Birth Epoch Time").c_str(), String(MISSING));
+    hvc_row(out, first, (p + "Discharge Total kWh").c_str(), String(MISSING));
+    hvc_row(out, first, (p + "Charge Total kWh").c_str(), String(MISSING));
+    hvc_row(out, first, (p + "AC Charge kWh").c_str(), String(MISSING));
+    hvc_row(out, first, (p + "DC Charge kWh").c_str(), String(MISSING));
+  }
+
+  hvc_row(out, first, "Assembly ID", b.assembly_id_hvbms_present ? String(b.assembly_id_hvbms) : String(MISSING));
+  hvc_row(out, first, "Usage ID", b.usage_id_hvbms_present ? String(b.usage_id_hvbms) : String(MISSING));
+  hvc_row(out, first, "Configuration Record",
+          b.config_hvbms_len ? hvc_q(hvc_hexstr(b.config_hvbms, b.config_hvbms_len)) : String(MISSING));
+  // HVBMS calibration records 0/1/6, ODIN's required-for-recovery set (routine 0x439).
+  {
+    static const uint8_t ids[TESLA_HVBMS_NUM_CAL] = {0, 1, 6};
+    for (uint8_t i = 0; i < TESLA_HVBMS_NUM_CAL; i++) {
+      String nm = "Calibration Record " + String(ids[i]);
+      hvc_row(out, first, nm.c_str(), b.hvbms_cal_present[i] ? String(b.hvbms_cal[i]) : String(MISSING));
+    }
+  }
+  hvc_row(out, first, "Package Part Number", b.package_pn_present ? hvc_q(b.package_pn) : String(MISSING));
+  hvc_row(out, first, "Package Serial Number", b.package_sn_present ? hvc_q(b.package_sn) : String(MISSING));
+  out += "\n        ]\n      },\n      \"data_type\": \"Table\",\n      \"name\": \"HVBMS Data\",\n"
+         "      \"units\": null\n    },\n";
+
+  // ---- block 1: HVP Data table ----
+  out += "    {\n      \"data\": {\n        \"headers\": [\n          \"Name\",\n          \"Data\"\n"
+         "        ],\n        \"rows\": [\n";
+  first = true;
+  hvc_row(out, first, "Assembly ID", b.assembly_id_hvp_present ? String(b.assembly_id_hvp) : String(MISSING));
+  hvc_row(out, first, "Usage ID", b.usage_id_hvp_present ? String(b.usage_id_hvp) : String(MISSING));
+  hvc_row(out, first, "Configuration Record",
+          b.config_hvp_len ? hvc_q(hvc_hexstr(b.config_hvp, b.config_hvp_len)) : String(MISSING));
+  // Calibration records in ODIN's row order (0x0501..0x0507, then the gain record its table omits).
+  // An erased record reads 0xFFFFFFFF - that is the pack's content, not a failed read.
+  static const char* const HVP_CAL_NAMES[TESLA_HVP_NUM_CAL] = {
+      "Shunt ASIC Gain",
+      "Shunt Bar Resistance",
+      "Shunt Thermal Coefficient Resistance A",
+      "Shunt Thermal Coefficient Resistance B",
+      "Shunt Thermal Coefficient Resistance C",
+      "Shunt Thermal Coefficient Resistance D",
+      "BMB ASIC Type",
+      "HVIL Configuration",
+  };
+  for (uint8_t i = 1; i < TESLA_HVP_NUM_CAL; i++) {
+    hvc_row(out, first, HVP_CAL_NAMES[i], b.hvp_cal_present[i] ? String(b.hvp_cal[i]) : String(MISSING));
+  }
+  hvc_row(out, first, HVP_CAL_NAMES[0], b.hvp_cal_present[0] ? String(b.hvp_cal[0]) : String(MISSING));
+  out += "\n        ]\n      },\n      \"data_type\": \"Table\",\n      \"name\": \"HVP Data\",\n"
+         "      \"units\": null\n    },\n";
+
+  // ---- blocks 2-4: Readable Time, Board Serial / Part Number ----
+  out += "    {\n      \"data\": \"";
+  out += (b.readable_time[0] ? b.readable_time : "Not Available");
+  out += "\",\n      \"data_type\": \"<class 'str'>\",\n      \"name\": \"Readable Time\",\n      \"units\": null\n    },\n";
+  out += "    {\n      \"data\": ";
+  out += b.board_sn_present ? hvc_q(b.board_sn) : String(MISSING);
+  out += ",\n      \"data_type\": \"<class 'str'>\",\n      \"name\": \"Board Serial Number\",\n      \"units\": null\n    },\n";
+  out += "    {\n      \"data\": ";
+  out += b.board_pn_present ? hvc_q(b.board_pn) : String(MISSING);
+  out += ",\n      \"data_type\": \"<class 'str'>\",\n      \"name\": \"Board Part Number\",\n      \"units\": null\n    },\n";
+
+  // ---- block 5: Pack Info. Brick Group Counts use ODIN's limits: SOC 96, CAC 96, BLEED 48.
+  auto groups = [](uint8_t bricks, uint8_t limit) -> uint8_t {
+    if (!bricks || !limit) return 0;
+    return (bricks + limit - 1) / limit;
+  };
+  out += "    {\n      \"data\": {\n";
+  out += "        \"Brick Group Counts\": {\n          \"Bleed Time\": " + String(groups(b.num_bricks, 48)) +
+         ",\n          \"CAC\": " + String(groups(b.num_bricks, 96)) +
+         ",\n          \"SOC\": " + String(groups(b.num_bricks, 96)) + "\n        },\n";
+  out += "        \"Histogram Page Counts\": {\n";
+  for (uint8_t h = 0; h < TESLA_HVC_NUM_HISTOGRAMS; h++) {
+    out += "          \"Histogram ID " + String(h + 1) + "\": " +
+           String(b.hist_page_count_present ? b.hist_page_count[h] : 0);
+    out += (h < TESLA_HVC_NUM_HISTOGRAMS - 1) ? ",\n" : "\n";
+  }
+  out += "        },\n";
+  out += "        \"Number Of Bricks\": " + String(b.num_bricks) + ",\n";
+  out += "        \"Number Of Modules\": " + String(b.num_modules) + "\n";
+  out += "      },\n      \"data_type\": \"<class 'dict'>\",\n      \"name\": \"Pack Info\",\n      \"units\": null\n    },\n";
+
+  // ---- blocks 6/7: Recovery Type / Version. PARTIAL tells a restore to recalibrate the skipped data.
+  out += "    {\n      \"data\": \"PARTIAL\",\n      \"data_type\": \"<class 'str'>\",\n      \"name\": \"Recovery Type\",\n      \"units\": null\n    },\n";
+  out += "    {\n      \"data\": \"1.0.1\",\n      \"data_type\": \"<class 'str'>\",\n      \"name\": \"Version\",\n      \"units\": null\n    },\n";
+
+  // ---- blocks 8-10: per-brick statistics, not read by a partial backup ----
+  auto missing_block = [&](const char* name) {
+    out += "    {\n      \"data\": \"MISSING\",\n      \"data_type\": \"<class 'str'>\",\n      \"name\": \"";
+    out += name;
+    out += "\",\n      \"units\": null\n    },\n";
+  };
+  missing_block("Brick SOC Data");
+  missing_block("Brick CAC Data");
+  missing_block("Brick Bleed Time Data");
+
+  // ---- block 11: read diagnostics (ours, appended after every block ODIN emits)
+  auto hex4 = [](uint16_t v) {
+    char buf[7];
+    snprintf(buf, sizeof(buf), "0x%04X", v);
+    return String(buf);
+  };
+  auto hex2 = [](uint8_t v) {
+    char buf[5];
+    snprintf(buf, sizeof(buf), "0x%02X", v);
+    return String(buf);
+  };
+  out += "    {\n      \"data\": {\n";
+  out += "        \"Energy Counters Bytes\": " + String(b.energy_counters_len) + ",\n";
+  out += "        \"Reads Refused\": " + String(b.nrc_count) + ",\n";
+  out += "        \"Negative Responses\": \"";
+  if (!b.nrc_records) {
+    out += "none";
+  } else {
+    for (uint8_t i = 0; i < b.nrc_records; i++) {
+      if (i) out += ", ";
+      out += hex4(b.nrc_did[i]) + " NRC " + hex2(b.nrc_code[i]);
+    }
+  }
+  out += "\",\n";
+  out += "        \"Calibration From DID Fallback\": \"";
+  {
+    bool any = false;
+    for (uint8_t i = 0; i < TESLA_HVP_NUM_CAL; i++) {
+      if (b.hvp_cal_present[i] && b.hvp_cal_from_did[i]) {
+        if (any) out += ", ";
+        out += hex4((uint16_t)(HVP_CAL_DID_BASE + i));
+        any = true;
+      }
+    }
+    if (!any) out += "none";
+  }
+  out += "\",\n";
+  out += "        \"Short Reads\": " + String(b.short_read_count) + ",\n";
+  out += "        \"First Short Read\": \"";
+  out += b.short_read_count ? (hex4(b.short_read_did) + " " + String(b.short_read_len) + " bytes") : String("none");
+  out += "\"\n";
+  out += "      },\n      \"data_type\": \"<class 'dict'>\",\n      \"name\": \"Read Diagnostics\",\n"
+         "      \"units\": null\n    }\n";
+
+  out += "  ],\n  \"exit_code\": 0,\n  \"exit_reason\": null,\n"
+         "  \"user_facing_msg\": \"Successfully read HVC backup data from Car Computer.\"\n}\n";
+  return out;
 }

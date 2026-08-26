@@ -121,17 +121,14 @@ static const std::map<int, String> leaf_chg_sta_rq = {{0, "other (default)"},
                                                       {1, "normal charge (experimental)"},
                                                       {2, "quick charge (experimental)"}};
 
-static const std::map<int, String> tesla_countries = {
-    {21843, "US (USA)"},     {17217, "CA (Canada)"},  {18242, "GB (UK & N Ireland)"},
-    {17483, "DK (Denmark)"}, {17477, "DE (Germany)"}, {16725, "AU (Australia)"}};
-
-static const std::map<int, String> tesla_mapregion = {
-    {8, "ME (Middle East)"}, {2, "NONE"},       {3, "CN (China)"},     {6, "TW (Taiwan)"}, {5, "JP (Japan)"},
-    {0, "US (USA)"},         {7, "KR (Korea)"}, {4, "AU (Australia)"}, {1, "EU (Europe)"}};
-
-static const std::map<int, String> tesla_chassis = {{0, "Model S"}, {1, "Model X"}, {2, "Model 3"}, {3, "Model Y"}};
-
 static const std::map<int, String> tesla_pack = {{0, "50 kWh"}, {2, "62 kWh"}, {1, "74 kWh"}, {3, "100 kWh"}};
+
+// Which CAN signal feeds datalayer battery status real_soc.
+static const std::map<int, String> tesla_soc_source = {{0, "BMS_socUI (default)"},
+                                                       {1, "BMS_socMin"},
+                                                       {2, "BMS_socAvg"},
+                                                       {3, "BMS_socMax"},
+                                                       {4, "BMS_userFacingSoe (mid-2024+ pack firmware)"}};
 
 static const std::map<int, String> sungrow_models = {
     {0, "SBR064 (6.4 kWh, 2 modules)"},  {1, "SBR096 (9.6 kWh, 3 modules)"},  {2, "SBR128 (12.8 kWh, 4 modules)"},
@@ -335,23 +332,12 @@ String settings_processor(const String& var, BatteryEmulatorSettingsStore& setti
                             name_for_comm_interface);
   }
 
-  // The GTW keys must render with the same fallbacks init_stored_settings()
-  // boots with (the driver globals), or a device that never saved them shows
-  // values the firmware is not running.
-  if (var == "GTWCOUNTRY") {
-    return options_from_map(settings.getUInt("GTWCOUNTRY", user_selected_tesla_GTW_country), tesla_countries);
-  }
-
-  if (var == "GTWMAPREG") {
-    return options_from_map(settings.getUInt("GTWMAPREG", user_selected_tesla_GTW_mapRegion), tesla_mapregion);
-  }
-
-  if (var == "GTWCHASSIS") {
-    return options_from_map(settings.getUInt("GTWCHASSIS", user_selected_tesla_GTW_chassisType), tesla_chassis);
-  }
-
   if (var == "GTWPACK") {
     return options_from_map(settings.getUInt("GTWPACK", user_selected_tesla_GTW_packEnergy), tesla_pack);
+  }
+
+  if (var == "TESLASOCSRC") {
+    return options_from_map(settings.getUInt("TESLASOCSRC", 0), tesla_soc_source);
   }
 
   if (var == "CHGSTARQ") {
@@ -908,7 +894,9 @@ String raw_settings_processor(const String& var, BatteryEmulatorSettingsStore& s
     return datalayer.battery.settings.user_requests_balancing ? "active" : "inactive";
   }
 
-  if (var == "BALANCING_MAX_TIME") {
+  // The page asks for %BAL_MAX_TIME%; this branch used to check "BALANCING_MAX_TIME", so the
+  // balancing max time value always rendered blank.
+  if (var == "BAL_MAX_TIME") {
     return String(datalayer.battery.settings.balancing_max_time_ms / 60000.0f, 1);
   }
 
@@ -1075,11 +1063,6 @@ String raw_settings_processor(const String& var, BatteryEmulatorSettingsStore& s
 
   if (var == "DIGITALHVIL") {
     return settings.getBool("DIGITALHVIL") ? "checked" : "";
-  }
-
-  if (var == "GTWRHD") {
-    // Boots true when unset, so it must also render checked when unset.
-    return settings.getBool("GTWRHD", user_selected_tesla_GTW_rightHandDrive) ? "checked" : "";
   }
 
   if (var == "CTOFFSET") {
@@ -1325,22 +1308,22 @@ const char* getCANInterfaceName(CAN_Interface interface) {
         function editBMSresetDuration(){var value=prompt('Amount of seconds BMS power should be off during periodic daily resets. Requires "Periodic BMS reset" to be enabled. Enter value in seconds (1-59):');if(value!==null){if(value>=1&&value<=600){var 
         xhr=new XMLHttpRequest();xhr.onload=editComplete;xhr.onerror=editError;xhr.open('GET','/updateBMSresetDuration?value='+value,true);xhr.send();}else{alert('Invalid value. Please enter a value between 1 and 59');}}}
 
-        function editTeslaBalAct(){var value=prompt('Enable or disable forced LFP balancing. Makes the battery charge to 101percent. This should be performed once every month, to keep LFP batteries balanced. Ensure battery is fully charged before enabling, and also that you have enough sun or grid power to feed power into the battery while balancing is active. Enter 1 for enabled, 0 for disabled');if(value!==null){if(value==0||value==1){var xhr=new 
+        function editTeslaBalAct(){var value=prompt('Enable or disable forced LFP charging. Makes the battery charge to 101percent. This should be performed once every month on LFP batteries, so the BMS can balance the cells at full charge. Ensure battery is fully charged before enabling, and also that you have enough sun or grid power to feed power into the battery while forced charging is active. Enter 1 for enabled, 0 for disabled');if(value!==null){if(value==0||value==1){var xhr=new
         XMLHttpRequest();xhr.onload=editComplete;xhr.onerror=editError;xhr.open('GET','/TeslaBalAct?value='+value,true);xhr.send();}}else{alert('Invalid value. Please enter 1 or 0');}}
     
-        function editBalTime(){var value=prompt('Enter new max balancing time in minutes');if(value!==null){if(value>=1&&value<=300){var xhr=new 
+        function editBalTime(){var value=prompt('Enter new max charging time in minutes');if(value!==null){if(value>=1&&value<=300){var xhr=new
         XMLHttpRequest();xhr.onload=editComplete;xhr.onerror=editError;xhr.open('GET','/BalTime?value='+value,true);xhr.send();}else{alert('Invalid value. Please enter a value between 1 and 300');}}}
     
-        function editBalFloatPower(){var value=prompt('Power level in Watt to float charge during forced balancing');if(value!==null){if(value>=100&&value<=2000){var xhr=new 
+        function editBalFloatPower(){var value=prompt('Power level in Watt to float charge during forced charging');if(value!==null){if(value>=100&&value<=2000){var xhr=new
         XMLHttpRequest();xhr.onload=editComplete;xhr.onerror=editError;xhr.open('GET','/BalFloatPower?value='+value,true);xhr.send();}else{alert('Invalid value. Please enter a value between 100 and 2000');}}}
     
-        function editBalMaxPackV(){var value=prompt('Battery pack max voltage temporarily raised to this value during forced balancing. Value in V');if(value!==null){if(value>=380&&value<=410){var xhr=new 
+        function editBalMaxPackV(){var value=prompt('Battery pack max voltage temporarily raised to this value during forced charging. Value in V');if(value!==null){if(value>=380&&value<=410){var xhr=new
         XMLHttpRequest();xhr.onload=editComplete;xhr.onerror=editError;xhr.open('GET','/BalMaxPackV?value='+value,true);xhr.send();}else{alert('Invalid value. Please enter a value between 380 and 410');}}}
 
-        function editBalMaxCellV(){var value=prompt('Cellvoltage max temporarily raised to this value during forced balancing. Value in mV');if(value!==null){if(value>=3400&&value<=3750){var xhr=new 
+        function editBalMaxCellV(){var value=prompt('Cellvoltage max temporarily raised to this value during forced charging. Value in mV');if(value!==null){if(value>=3400&&value<=3750){var xhr=new
         XMLHttpRequest();xhr.onload=editComplete;xhr.onerror=editError;xhr.open('GET','/BalMaxCellV?value='+value,true);xhr.send();}else{alert('Invalid value. Please enter a value between 3400 and 3750');}}}
     
-        function editBalMaxDevCellV(){var value=prompt('Cellvoltage max deviation temporarily raised to this value during forced balancing. Value in mV');if(value!==null){if(value>=300&&value<=600){var xhr=new 
+        function editBalMaxDevCellV(){var value=prompt('Cellvoltage max deviation temporarily raised to this value during forced charging. Value in mV');if(value!==null){if(value>=300&&value<=600){var xhr=new
         XMLHttpRequest();xhr.onload=editComplete;xhr.onerror=editError;xhr.open('GET','/BalMaxDevCellV?value='+value,true);xhr.send();}else{alert('Invalid value. Please enter a value between 300 and 600');}}}
 
           function editFakeBatteryVoltage(){var value=prompt('Enter new fake battery voltage');if(value!==null){if(value>=0&&value<=5000){var xhr=new 
@@ -1855,19 +1838,11 @@ const char* getCANInterfaceName(CAN_Interface interface) {
         <div class="if-tesla">
           <label for='digitalhvil'>Digital HVIL (2024+): </label>
           <input type='checkbox' name='DIGITALHVIL' id='digitalhvil' value='on' %DIGITALHVIL% />
-          <label>Right hand drive: </label>
-          <input type='checkbox' name='GTWRHD' value='on' %GTWRHD% />
-          <label for='GTWCOUNTRY'>Country code: </label><select name='GTWCOUNTRY' id='GTWCOUNTRY'>
-          %GTWCOUNTRY%
-          </select>
-          <label for='GTWMAPREG'>Map region: </label><select name='GTWMAPREG' id='GTWMAPREG'>
-          %GTWMAPREG%
-          </select>
-          <label for='GTWCHASSIS'>Chassis type: </label><select name='GTWCHASSIS' id='GTWCHASSIS'>
-          %GTWCHASSIS%
-          </select>
           <label for='GTWPACK'>Pack type: </label><select name='GTWPACK' id='GTWPACK'>
           %GTWPACK%
+          </select>
+          <label for='TESLASOCSRC'>SOC source: </label><select name='TESLASOCSRC' id='TESLASOCSRC'>
+          %TESLASOCSRC%
           </select>
         </div>
 
@@ -2425,12 +2400,12 @@ const char* getCANInterfaceName(CAN_Interface interface) {
       
     <div style='background-color: #303E47; padding: 10px; margin-bottom: 10px;border-radius: 50px' class="%MANUAL_BAL_CLASS%">
 
-          <h4 style='color: white;'>Manual LFP balancing: <span id='TSL_BAL_ACT'><span class="%MANUAL_BALANCING_CLASS%">%MANUAL_BALANCING%</span>
+          <h4 style='color: white;'>Forced LFP charging: <span id='TSL_BAL_ACT'><span class="%MANUAL_BALANCING_CLASS%">%MANUAL_BALANCING%</span>
           </span> <button onclick='editTeslaBalAct()'>Edit</button></h4>
 
-          <h4 class="%BALANCING_CLASS%"><span>Balancing max time: %BAL_MAX_TIME% Minutes</span> <button onclick='editBalTime()'>Edit</button></h4>
+          <h4 class="%BALANCING_CLASS%"><span>Charging max time: %BAL_MAX_TIME% Minutes</span> <button onclick='editBalTime()'>Edit</button></h4>
 
-          <h4 class="%BALANCING_CLASS%"><span>Balancing float power: %BAL_POWER% W </span> <button onclick='editBalFloatPower()'>Edit</button></h4>
+          <h4 class="%BALANCING_CLASS%"><span>Charging float power: %BAL_POWER% W </span> <button onclick='editBalFloatPower()'>Edit</button></h4>
 
            <h4 class="%BALANCING_CLASS%"><span>Max battery voltage: %BAL_MAX_PACK_VOLTAGE% V</span> <button onclick='editBalMaxPackV()'>Edit</button></h4>
 

@@ -150,11 +150,8 @@ void init_stored_settings() {
   user_selected_use_estimated_SOC = settings.getBool("SOCESTIMATED", false);
   user_selected_use_estimated_charge_limits = settings.getBool("CHGESTIMATED", false);
   user_selected_tesla_digital_HVIL = settings.getBool("DIGITALHVIL", false);
-  user_selected_tesla_GTW_country = settings.getUInt("GTWCOUNTRY", user_selected_tesla_GTW_country);
-  user_selected_tesla_GTW_rightHandDrive = settings.getBool("GTWRHD", user_selected_tesla_GTW_rightHandDrive);
-  user_selected_tesla_GTW_mapRegion = settings.getUInt("GTWMAPREG", user_selected_tesla_GTW_mapRegion);
-  user_selected_tesla_GTW_chassisType = settings.getUInt("GTWCHASSIS", user_selected_tesla_GTW_chassisType);
   user_selected_tesla_GTW_packEnergy = settings.getUInt("GTWPACK", user_selected_tesla_GTW_packEnergy);
+  user_selected_tesla_soc_source = settings.getUInt("TESLASOCSRC", user_selected_tesla_soc_source);
   user_selected_primo_gen24 = settings.getBool("PRIMOGEN24", false);
   user_selected_accept_inverter_reboot = settings.getBool("INVACCREB", false);
   // Watchdog period the inverter last told us about, or the default if it never has

@@ -108,6 +108,16 @@ static const uint8_t notice_events[] = {
     EVENT_WIFI_AP_PASSWORD_DEFAULT,
     EVENT_PERIODIC_BMS_RESET,
     EVENT_BMS_RESET_REQ_SUCCESS,
+    EVENT_HVP_RESET_REQ_SUCCESS,
+    EVENT_HVP_RESET_REQ_FAIL,
+    EVENT_PCS_RESET_REQ_SUCCESS,
+    EVENT_PCS_RESET_REQ_FAIL,
+    EVENT_CAC_RESET_SUCCESS,
+    EVENT_CAC_RESET_FAIL,
+    EVENT_CLEAR_BLOCKED_CONTACTORS_REQ,
+    EVENT_CLEAR_BLOCKED_CONTACTORS_FAIL,
+    EVENT_ISOLATION_MONITOR_DISABLED,
+    EVENT_ISOLATION_MONITOR_ENABLED,
     // Reset cause - fires exactly once per boot and answers "why did it come back".
     // The WDT/panic/lockup causes are already warning.
     EVENT_RESET_UNKNOWN,
@@ -297,6 +307,16 @@ void init_events(void) {
   events.entries[EVENT_PERIODIC_BMS_RESET].level = EVENT_LEVEL_INFO;
   events.entries[EVENT_BMS_RESET_REQ_SUCCESS].level = EVENT_LEVEL_INFO;
   events.entries[EVENT_BMS_RESET_REQ_FAIL].level = EVENT_LEVEL_INFO;
+  events.entries[EVENT_HVP_RESET_REQ_SUCCESS].level = EVENT_LEVEL_INFO;
+  events.entries[EVENT_HVP_RESET_REQ_FAIL].level = EVENT_LEVEL_INFO;
+  events.entries[EVENT_PCS_RESET_REQ_SUCCESS].level = EVENT_LEVEL_INFO;
+  events.entries[EVENT_PCS_RESET_REQ_FAIL].level = EVENT_LEVEL_INFO;
+  events.entries[EVENT_CAC_RESET_SUCCESS].level = EVENT_LEVEL_INFO;
+  events.entries[EVENT_CAC_RESET_FAIL].level = EVENT_LEVEL_INFO;
+  events.entries[EVENT_CLEAR_BLOCKED_CONTACTORS_REQ].level = EVENT_LEVEL_INFO;
+  events.entries[EVENT_CLEAR_BLOCKED_CONTACTORS_FAIL].level = EVENT_LEVEL_INFO;
+  events.entries[EVENT_ISOLATION_MONITOR_DISABLED].level = EVENT_LEVEL_INFO;
+  events.entries[EVENT_ISOLATION_MONITOR_ENABLED].level = EVENT_LEVEL_INFO;
   events.entries[EVENT_BATTERY_TEMP_DEVIATION_HIGH].level = EVENT_LEVEL_WARNING;
   events.entries[EVENT_BATTERY2_TEMP_DEVIATION_HIGH].level = EVENT_LEVEL_WARNING;
   events.entries[EVENT_BATTERY3_TEMP_DEVIATION_HIGH].level = EVENT_LEVEL_WARNING;
@@ -713,6 +733,26 @@ static String get_event_base_message(EVENTS_ENUM_TYPE event) {
       return "BMS reset request completed successfully.";
     case EVENT_BMS_RESET_REQ_FAIL:
       return "BMS reset request failed - check contactors are open.";
+    case EVENT_HVP_RESET_REQ_SUCCESS:
+      return "HVP/HVC reset request sent.";
+    case EVENT_HVP_RESET_REQ_FAIL:
+      return "HVP/HVC reset request failed - check contactors are open.";
+    case EVENT_PCS_RESET_REQ_SUCCESS:
+      return "PCS reset request sent.";
+    case EVENT_PCS_RESET_REQ_FAIL:
+      return "PCS reset request failed - check contactors are open.";
+    case EVENT_CAC_RESET_SUCCESS:
+      return "Brick CAC reset accepted by BMS.";
+    case EVENT_CAC_RESET_FAIL:
+      return "CAC reset rejected or not started - check contactors are open.";
+    case EVENT_CLEAR_BLOCKED_CONTACTORS_REQ:
+      return "Clear blocked contactors sequence started (VSH + isolation clear + HVBMS/HVP reset).";
+    case EVENT_CLEAR_BLOCKED_CONTACTORS_FAIL:
+      return "Clear blocked contactors not started - check contactors are open.";
+    case EVENT_ISOLATION_MONITOR_DISABLED:
+      return "Isolation monitor disabled by user request.";
+    case EVENT_ISOLATION_MONITOR_ENABLED:
+      return "Isolation monitor re-enabled by user request.";
     case EVENT_GPIO_CONFLICT:
       return "GPIO Pin Conflict: The pin used by '" + esp32hal->failed_allocator() + "' is already allocated by '" +
              esp32hal->conflicting_allocator() + "'. Please check your configuration and assign different pins.";

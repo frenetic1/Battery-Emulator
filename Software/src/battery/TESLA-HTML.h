@@ -19,6 +19,9 @@ class TeslaHtmlRenderer : public BatteryHtmlRenderer {
  public:
   String get_status_html() {
     String content;
+    // This page appends ~180 fragments; reserve up front so the String does not repeatedly realloc
+    // and fragment the ESP32 heap while building. Page-load path only, not a hot loop.
+    content.reserve(8192);
 
     float beginning_of_life = static_cast<float>(datalayer_extended.tesla.battery_beginning_of_life);
     float battTempPct = static_cast<float>(datalayer_extended.tesla.battery_battTempPct) * 0.4f;
@@ -165,6 +168,8 @@ class TeslaHtmlRenderer : public BatteryHtmlRenderer {
     static const char* BMS_uiChargeStatus[] = {"DISCONNECTED", "NO_POWER",        "ABOUT_TO_CHARGE",
                                                "CHARGING",     "CHARGE_COMPLETE", "CHARGE_STOPPED"};
     static const char* PCS_dcdcStatus[] = {"IDLE", "ACTIVE", "FAULTED"};
+    static const char* BMS_cacSource[] = {"UNKNOWN", "RESTING_POINT_CAC", "LIFE_MODEL", "UNINITIALIZED_LIFE_MODEL"};
+    static const char* vehicleStateText[] = {"OFF", "DRIVE", "ACCESSORY", "GOING_DOWN"};
     static const char* PCS_dcdcMainState[] = {"STANDBY",          "12V_SUPPORT_ACTIVE", "PRECHARGE_STARTUP",
                                               "PRECHARGE_ACTIVE", "DIS_HVBUS_ACTIVE",   "SHUTDOWN",
                                               "FAULTED"};
@@ -203,13 +208,42 @@ class TeslaHtmlRenderer : public BatteryHtmlRenderer {
            sizeof(datalayer_extended.tesla.battery_partNumber));
     readableBatteryPartNumber[12] = '\0';  // Null terminate the string
     content += "<h4>Battery Part Number: " + String(readableBatteryPartNumber) + "</h4>";
-    //0x3C4 PCS_info
+    //UDS 0xF012 BOARD_PART_NUMBER on the HVBMS - the board, not the pack package part number. The
+    //HVBMS and HVP live on the same HVC board, so this is the HVP's board part number too, which is
+    //why the HVP is not read or listed separately.
+    char readableBMSPartNumber[13];  // One extra space for null terminator
+    memcpy(readableBMSPartNumber, datalayer_extended.tesla.BMS_partNumber,
+           sizeof(datalayer_extended.tesla.BMS_partNumber));
+    readableBMSPartNumber[12] = '\0';  // Null terminate the string
+    content += "<h4>HVBMS/HVC Part Number: " + String(readableBMSPartNumber) + "</h4>";
+    //0x3C4 PCS_info broadcast, or UDS 0xF012 on the PCS
     char readablePCSPartNumber[13];  // One extra space for null terminator
     memcpy(readablePCSPartNumber, datalayer_extended.tesla.PCS_partNumber,
            sizeof(datalayer_extended.tesla.PCS_partNumber));
     readablePCSPartNumber[12] = '\0';  // Null terminate the string
     content += "<h4>PCS Part Number: " + String(readablePCSPartNumber) + "</h4>";
-    content += "<h4>Battery Manufacture Date: " + String(datalayer_extended.tesla.battery_manufactureDate) + "</h4>";
+    //Decoded from the serial number. NULL until a serial has been read, so guard it explicitly
+    //rather than relying on String's own NULL handling.
+    content += "<h4>Battery Manufacture Date: " +
+               String(datalayer_extended.tesla.battery_manufactureDate
+                          ? datalayer_extended.tesla.battery_manufactureDate
+                          : "") +
+               "</h4>";
+    //ECU firmware-version fingerprint (DID 0xF180 + 0x0F00/0x0F02): paste into the packid tool
+    //(`packid match-fingerprint '<line>'`) to resolve HVBMS/HVP/PCS to an ice software release.
+    {
+      uint8_t verState = datalayer_extended.tesla.ecu_version_query_state;
+      content += "<h4>ECU FW Fingerprint: ";
+      if (verState == 2) {
+        content += "<code style='word-break:break-all'>" +
+                   String(datalayer_extended.tesla.ecu_version_fingerprint) + "</code>";
+      } else if (verState == 1) {
+        content += "querying...";
+      } else {
+        content += "(press 'Query ECU Versions')";
+      }
+      content += "</h4>";
+    }
     content += "<h4>Battery Pack Mass: " + String(packMass) + " KG</h4>";
     //0x3D2 978 BMS_kwhCounter
     content += "<h4>Battery Total Discharge: " + String(total_discharge) + " kWh</h4>";
@@ -284,12 +318,20 @@ class TeslaHtmlRenderer : public BatteryHtmlRenderer {
     }
     content += "<h4>Balancing Total (since last BMS reset/power cycle): " + String(datalayer_extended.tesla.BMS_cumulativeBleedTime_s) +
                " s</h4>";
+    if (datalayer_extended.tesla.BMS_brickBleedValid) {
+      content += "<h4>Bricks Bleeding Now: " + String(datalayer_extended.tesla.BMS_brickBleedActiveCount) + " of " +
+                 String(datalayer_extended.tesla.BMS_brickCount) + "</h4>";
+    }
     //0x212 530 BMS_status
     content += "<h4>Isolation Resistance: " + String(isolationResistance) + " kOhms</h4>";
     content += "<h4>BMS State: " + String(BMS_state[datalayer_extended.tesla.BMS_state]) + "</h4>";
     content += "<h4>BMS HV State: " + String(BMS_hvState[datalayer_extended.tesla.BMS_hvState]) + "</h4>";
     content += "<h4>BMS UI Charge Status: " + String(BMS_uiChargeStatus[datalayer_extended.tesla.BMS_uiChargeStatus]) +
                "</h4>";
+    content += "<h4>CAC Estimation Source: " + String(BMS_cacSource[datalayer_extended.tesla.BMS_cacEstimationSource & 0x03]) +
+               "</h4>";
+    content += "<h4>Vehicle State: " + String(vehicleStateText[datalayer_extended.tesla.vehicleState & 0x03]) +
+               (datalayer_extended.tesla.balance_at_rest_enabled ? " (Balance At Rest: ON)" : "") + "</h4>";
     content += "<h4>BMS_buildConfigId: " + String(datalayer_extended.tesla.BMS_info_buildConfigId) + "</h4>";
     content += "<h4>BMS_hardwareId: " + String(datalayer_extended.tesla.BMS_info_hardwareId) + "</h4>";
     content += "<h4>BMS_componentId: " + String(datalayer_extended.tesla.BMS_info_componentId) + "</h4>";

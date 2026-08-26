@@ -32,11 +32,8 @@ extern bool user_selected_use_estimated_charge_limits;
 extern bool user_selected_LEAF_interlock_mandatory;
 extern uint8_t user_selected_LEAF_chg_sta_rq;
 extern bool user_selected_tesla_digital_HVIL;
-extern uint16_t user_selected_tesla_GTW_country;
-extern bool user_selected_tesla_GTW_rightHandDrive;
-extern uint16_t user_selected_tesla_GTW_mapRegion;
-extern uint16_t user_selected_tesla_GTW_chassisType;
 extern uint16_t user_selected_tesla_GTW_packEnergy;
+extern uint16_t user_selected_tesla_soc_source;
 extern uint16_t user_selected_pylon_baudrate;
 
 /* User-selected DALY BMS settings */

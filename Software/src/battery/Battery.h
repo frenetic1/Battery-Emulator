@@ -93,8 +93,18 @@ class Battery {
   virtual bool mandatory_charge_taper() { return false; }
 
   virtual bool supports_clear_isolation() { return false; }
+  /* Warning line appended to the confirm prompt of commands that open the pack contactors while
+     they run (e.g. the Tesla contactor guard). nullptr = the command does not move contactors. */
+  virtual const char* contactor_open_warning() { return nullptr; }
   virtual bool supports_reset_BMS() { return false; }
+  virtual bool supports_reset_HVP() { return false; }
+  virtual bool supports_reset_PCS() { return false; }
+  virtual bool supports_clear_blocked_contactors() { return false; }
+  virtual bool supports_hvc_backup() { return false; }
   virtual bool supports_reset_SOC() { return false; }
+  virtual bool supports_reset_CAC() { return false; }
+  virtual bool supports_disable_isolation_monitor() { return false; }
+  virtual bool supports_set_vehicle_mode() { return false; }
   virtual bool supports_reset_crash() { return false; }
   virtual bool supports_reset_NVROL() { return false; }
   virtual bool supports_reset_DTC() { return false; }
@@ -119,12 +129,32 @@ class Battery {
   // visible (instead of a single toggle). Used by batteries where balancing is a latching request.
   virtual bool supports_balancing_request() { return false; }
   virtual bool supports_isolation_test() { return false; }
+  virtual bool supports_query_ecu_versions() { return false; }
 
+  virtual void query_ecu_versions() {}
   virtual void request_isolation_test() {}
   virtual void clear_isolation() {}
   virtual void calibrate_SOC() {}
   virtual void reset_BMS() {}
+  virtual void reset_HVP() {}
+  virtual void reset_PCS() {}
+  virtual void clear_blocked_contactors() {}
+  virtual void request_hvc_backup_partial() {}
+  virtual bool hvc_backup_available() { return false; }
+  virtual String hvc_backup_json() { return String(""); }
+  // Name for the downloaded backup, without extension. Empty means "no identity to name it after",
+  // and the caller falls back to an uptime stamp.
+  virtual String hvc_backup_name() { return String(""); }
+  // Progress of the backup read, polled by the web UI so it can start the download when the read
+  // finishes. JSON: {"state":"idle|running|ready|refused","phase":"...","ok":n,"reads":n}.
+  virtual String hvc_backup_status_json() { return String("{\"state\":\"unsupported\"}"); }
   virtual void reset_SOC() {}
+  virtual void reset_CAC() {}
+  virtual void disable_isolation_monitor() {}
+  virtual void enable_isolation_monitor() {}
+  virtual void set_vehicle_mode_drive() {}
+  virtual void set_vehicle_mode_accessory() {}
+  virtual void toggle_balance_at_rest() {}
   virtual void reset_crash() {}
   virtual void reset_contactor() {}
   virtual void reset_NVROL() {}

@@ -36,6 +36,16 @@ struct BatteryCommand {
 
   // Reload page after running (for read commands).
   bool reload_after = false;
+
+  // Optional extra markup rendered right after the button, for commands that need more than
+  // fire-and-forget - progress readouts, status polling. Receives the battery index. Called only
+  // when condition() passed, so it can assume the command is supported.
+  std::function<String(int)> extra_html = nullptr;
+
+  // Optional per-battery addition to the confirm prompt (e.g. a contactor warning that only
+  // applies to batteries that run the command under a contactor guard). nullptr result = nothing
+  // to add. Called only when condition() passed.
+  std::function<const char*(Battery*)> prompt_extra = nullptr;
 };
 
 extern std::vector<BatteryCommand> battery_commands;
