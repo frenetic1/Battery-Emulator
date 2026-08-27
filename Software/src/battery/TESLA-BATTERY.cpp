@@ -1054,8 +1054,8 @@ void TeslaBattery::
   datalayer_extended.tesla.BMS_alertMatrixActive[45] = BMS_a088_SW_VcFront_MIA_InDrive;
   datalayer_extended.tesla.BMS_alertMatrixActive[46] = BMS_a089_SW_VcFront_MIA;
   datalayer_extended.tesla.BMS_alertMatrixActive[47] = BMS_a090_SW_Gateway_MIA;
-  datalayer_extended.tesla.BMS_alertMatrixActive[48] = BMS_a091_SW_ChargePort_MIA;
-  datalayer_extended.tesla.BMS_alertMatrixActive[49] = BMS_a092_SW_ChargePort_Mia_On_Hv;
+  //datalayer_extended.tesla.BMS_alertMatrixActive[48] = BMS_a091_SW_ChargePort_MIA; // Suppress for standalone pack operation
+  //datalayer_extended.tesla.BMS_alertMatrixActive[49] = BMS_a092_SW_ChargePort_Mia_On_Hv; // Suppress for standalone pack operation
   datalayer_extended.tesla.BMS_alertMatrixActive[50] = BMS_a094_SW_Drive_Inverter_MIA;
   datalayer_extended.tesla.BMS_alertMatrixActive[51] = BMS_a099_SW_BMB_Communication;
   datalayer_extended.tesla.BMS_alertMatrixActive[52] = BMS_a105_SW_One_Module_Tsense;
@@ -1128,7 +1128,7 @@ void TeslaBattery::
   datalayer_extended.tesla.PCS_alertMatrixActive[19] = PCS_a020_chgEnableLineMismatch;
   datalayer_extended.tesla.PCS_alertMatrixActive[20] = PCS_a021_hvpMia;
   datalayer_extended.tesla.PCS_alertMatrixActive[21] = PCS_a022_bmsMia;
-  datalayer_extended.tesla.PCS_alertMatrixActive[22] = PCS_a023_cpMia;
+  //datalayer_extended.tesla.PCS_alertMatrixActive[22] = PCS_a023_cpMia; // Suppress for standalone pack operation
   datalayer_extended.tesla.PCS_alertMatrixActive[23] = PCS_a024_vcfrontMia;
   datalayer_extended.tesla.PCS_alertMatrixActive[24] = PCS_a025_cpu2Malfunction;
   datalayer_extended.tesla.PCS_alertMatrixActive[25] = PCS_a026_watchdogAlarmed;
@@ -2173,7 +2173,7 @@ void TeslaBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
         PCS_a020_chgEnableLineMismatch = ((rx_frame.data.u8[2] >> 7) & (0x01U));
         PCS_a021_hvpMia = (rx_frame.data.u8[3] & (0x01U));
         PCS_a022_bmsMia = ((rx_frame.data.u8[3] >> 1) & (0x01U));
-        PCS_a023_cpMia = ((rx_frame.data.u8[3] >> 2) & (0x01U));
+        //PCS_a023_cpMia = ((rx_frame.data.u8[3] >> 2) & (0x01U)); // Suppress for standalone pack operation
         PCS_a024_vcfrontMia = ((rx_frame.data.u8[3] >> 3) & (0x01U));
         PCS_a025_cpu2Malfunction = ((rx_frame.data.u8[3] >> 4) & (0x01U));
         PCS_a026_watchdogAlarmed = ((rx_frame.data.u8[3] >> 5) & (0x01U));
