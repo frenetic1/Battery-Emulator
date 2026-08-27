@@ -36,8 +36,7 @@ struct TeslaHvcBackup {
   char package_sn[24] = {0};  // 0xF015
   char board_pn[24] = {0};    // 0xF012
   char board_sn[24] = {0};    // 0xF013
-  bool package_pn_present = false, package_sn_present = false, board_pn_present = false,
-       board_sn_present = false;
+  bool package_pn_present = false, package_sn_present = false, board_pn_present = false, board_sn_present = false;
 
   uint8_t config_hvbms[64] = {0};  // CONFIGURATION_RECORD 0x439 (HVBMS)
   uint8_t config_hvbms_len = 0;
@@ -239,9 +238,7 @@ class TeslaBattery : public UdsCanBattery {
   void reset_HVP() { datalayer_battery->settings.user_requests_tesla_hvp_reset = true; }
 
   bool supports_clear_blocked_contactors() { return true; }
-  void clear_blocked_contactors() {
-    datalayer_battery->settings.user_requests_tesla_clear_blocked_contactors = true;
-  }
+  void clear_blocked_contactors() { datalayer_battery->settings.user_requests_tesla_clear_blocked_contactors = true; }
 
   bool supports_reset_PCS() { return true; }
   void reset_PCS() { datalayer_battery->settings.user_requests_tesla_pcs_reset = true; }
@@ -290,7 +287,7 @@ class TeslaBattery : public UdsCanBattery {
   bool isolation_monitor_disabling = false;
   bool iso_mon_needs_assert = false;
   bool battery_was_alive = false;
-  bool brickv_requested = false;   // one-shot fast cell populate via UDS DID 0x410 at startup
+  bool brickv_requested = false;  // one-shot fast cell populate via UDS DID 0x410 at startup
   uint8_t brickv_attempts = 0;
   static constexpr uint8_t TESLA_BRICKV_MAX_ATTEMPTS = 3;
   static constexpr uint16_t TESLA_BRICKV_COUNT = 108;
@@ -445,10 +442,10 @@ class TeslaBattery : public UdsCanBattery {
   //static bool uds_SessionInProgress = false; // Future use
   //0x221 VCFRONT_LVPowerState
   uint8_t alternateMux = 1;
-  uint8_t frameCounter_TESLA_221 = 15;  // Start at 15 for Mux 0
-  uint8_t vehicleState = 1;             // "OFF": 0, "DRIVE": 1, "ACCESSORY": 2, "GOING_DOWN": 3
-  bool accessory_mode_forced = false;   // vehicleState = ACCESSORY (set by button or auto), otherwise DRIVE
-  bool power_zeroed = false;            // ACCESSORY button zeroes charge/discharge; DRIVE button clears it
+  uint8_t frameCounter_TESLA_221 = 15;   // Start at 15 for Mux 0
+  uint8_t vehicleState = 1;              // "OFF": 0, "DRIVE": 1, "ACCESSORY": 2, "GOING_DOWN": 3
+  bool accessory_mode_forced = false;    // vehicleState = ACCESSORY (set by button or auto), otherwise DRIVE
+  bool power_zeroed = false;             // ACCESSORY button zeroes charge/discharge; DRIVE button clears it
   bool balance_at_rest_enabled = false;  // experimental: auto DRIVE/ACCESSORY by load so the pack can balance at rest
   unsigned long rest_below_since_ms = 0;
   static constexpr int32_t TESLA_REST_THRESHOLD_dA = 10;  // 1 A in deci-amps
@@ -749,8 +746,11 @@ class TeslaBattery : public UdsCanBattery {
                                           .data = {0x90, 0x80, 0x05, 0x08, 0x00, 0x00, 0x00, 0x01}};
 
   //0x39D IBST_status (initial frame): counter 8, checksum 0x00
-  static constexpr CAN_frame TESLA_39D_INITIAL = {
-      .FD = false, .ext_ID = false, .DLC = 5, .ID = 0x39D, .data = {0x00, 0x58, 0xE1, 0x27, 0x00}};
+  static constexpr CAN_frame TESLA_39D_INITIAL = {.FD = false,
+                                                  .ext_ID = false,
+                                                  .DLC = 5,
+                                                  .ID = 0x39D,
+                                                  .data = {0x00, 0x58, 0xE1, 0x27, 0x00}};
 
   //0x39D IBST_status: "cycle_time" 50ms, IBST_statusChecksum/IBST_statusCounter generated via generateFrameCounterChecksum
   //Seeded to counter 8 so the first regenerate lands on counter 9
@@ -976,8 +976,8 @@ class TeslaBattery : public UdsCanBattery {
   //static buffer. Must stay initialised: update_values() copies it into the datalayer for the web UI,
   //which would otherwise strlen() an indeterminate pointer and panic the board.
   char* battery_manufactureDate = nullptr;  // YYYY-MM-DD\0
-                                         //Via UDS 0xF014
-  uint8_t battery_partNumber[12] = {0};  //stores raw HEX values for ASCII chars
+                                            //Via UDS 0xF014
+  uint8_t battery_partNumber[12] = {0};     //stores raw HEX values for ASCII chars
   bool parsed_battery_partNumber = false;
   //Via UDS 0xF012 on the HVBMS - the BMS board itself, not the pack package part number
   uint8_t BMS_partNumber[12] = {0};  //stores raw HEX values for ASCII chars

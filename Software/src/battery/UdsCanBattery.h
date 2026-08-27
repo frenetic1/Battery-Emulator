@@ -234,7 +234,8 @@ class UdsCanBattery : public CanBattery, public IsoTp {
   // The request currently in flight as part of a sequence.
   struct {
     uint8_t sid;
-    uint8_t data[20]; // For Tesla - will need increasing substantially for firmware update functionality over UDS (block sizes)
+    uint8_t data
+        [20];  // For Tesla - will need increasing substantially for firmware update functionality over UDS (block sizes)
     uint8_t len;
     uint16_t timeout_ticks;  // original timeout, re-applied on each retry
     uint8_t retries;

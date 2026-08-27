@@ -159,8 +159,8 @@ inline void setBitField(uint8_t* data, int bytes, int startBit, int bitLen, uint
 // Shared core for the Tesla counter+checksum frames: write `counter` into the counter field, then
 // recompute the additive 8-bit checksum (low byte of ID + payload with the checksum bits zeroed +
 // high nibble of the ID's top byte). The two public wrappers differ only in how `counter` is chosen.
-static void applyCounterChecksum(CAN_frame& f, uint64_t counter, int ctrStartBit, int ctrBitLength,
-                                 int csumStartBit, int csumBitLength) {
+static void applyCounterChecksum(CAN_frame& f, uint64_t counter, int ctrStartBit, int ctrBitLength, int csumStartBit,
+                                 int csumBitLength) {
   int bytes = getDataLen(f.DLC);
   auto data = f.data.u8;
 
@@ -475,7 +475,7 @@ void TeslaBattery::
         datalayer_battery->status.real_soc = (battery_soc_ui * 10);
       }
       break;
-    default:  //battery_soc_ui (0x292 BMS_socUI)
+    default:                                                       //battery_soc_ui (0x292 BMS_socUI)
       datalayer_battery->status.real_soc = (battery_soc_ui * 10);  //increase SOC range from 0-100.0 -> 100.00
       break;
   }
@@ -653,8 +653,7 @@ void TeslaBattery::
   }
   if (datalayer_battery->settings.user_requests_tesla_soc_reset) {
     datalayer_battery->settings.user_requests_tesla_soc_reset = false;
-    if (contactors_open &&
-        (datalayer_battery->status.real_soc < 1500 || datalayer_battery->status.real_soc > 9000)) {
+    if (contactors_open && (datalayer_battery->status.real_soc < 1500 || datalayer_battery->status.real_soc > 9000)) {
       start_sequence(TESLA_UDS_SOC_RESET);
       logging.println("INFO: SOC reset requested");
     } else {
@@ -838,8 +837,7 @@ void TeslaBattery::
   }
   battery_was_alive = battery_alive;
 
-  if (isolation_monitor_disable_latched && iso_mon_needs_assert && BMS_state == BMS_STATE_SUPPORT &&
-      !uds_is_busy()) {
+  if (isolation_monitor_disable_latched && iso_mon_needs_assert && BMS_state == BMS_STATE_SUPPORT && !uds_is_busy()) {
     iso_mon_needs_assert = false;
     isolation_monitor_disabling = true;
     start_sequence(TESLA_UDS_ISO_MON);
@@ -1557,9 +1555,8 @@ void TeslaBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
             ((rx_frame.data.u8[6] & 0xFC) >> 2)));  //50|10@1+ (0.02,0) [0|20.46] "kW"  //Example 1000 * 0.02 = 20kW?
       BMS_notEnoughPowerForHeatPump =
           ((rx_frame.data.u8[5] >> 2) & (0x01U));  //BMS_notEnoughPowerForHeatPump : 42|1@1+ (1,0) [0|1] ""  Receiver
-      BMS_powerLimitState =
-          (rx_frame.data.u8[6] &
-           (0x01U));  //BMS_powerLimitsState : 48|1 in 2021.24.4..2025.14.7; moved to bit 42 only at
+      BMS_powerLimitState = (rx_frame.data.u8[6] &
+                             (0x01U));  //BMS_powerLimitsState : 48|1 in 2021.24.4..2025.14.7; moved to bit 42 only at
       //2025.20.3+. The bench pack's HVBMS bootloader (0xF180 identity, packid) is 0x31ca5286, the
       //pre-2024.44.3.1 boot -> firmware <=2024.38.7 -> bit 48 is correct here. Reading bit 42 on this
       //pack would return notEnoughPowerForHeatPump instead. Revisit if a 2025.20.3+ pack is used.
@@ -1624,8 +1621,8 @@ void TeslaBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
         BMS_balanceTimeThisCycle_s = (((rx_frame.data.u8[4] << 8) | rx_frame.data.u8[3]) / 2);
       } else if (mux == 39) {
         //BMS_cumulativeBleedTime m39 : 8|24@1+ (1,0) "s"
-        BMS_cumulativeBleedTime_s = ((uint32_t)rx_frame.data.u8[3] << 16) |
-                                    ((uint32_t)rx_frame.data.u8[2] << 8) | rx_frame.data.u8[1];
+        BMS_cumulativeBleedTime_s =
+            ((uint32_t)rx_frame.data.u8[3] << 16) | ((uint32_t)rx_frame.data.u8[2] << 8) | rx_frame.data.u8[1];
       } else if (mux == 65) {
         //BMS_cacEstimationSource m65 : 60|2@1+ (1,0)
         BMS_cacEstimationSource = (rx_frame.data.u8[7] >> 4) & 0x03;
@@ -1787,10 +1784,10 @@ void TeslaBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
       if ((uint16_t)mux * 3 + 2 >= MAX_AMOUNT_CELLS) {
         break;
       }
-                                    //StatusFlags : 8|8@1+ (1,0) [0|0] ""
-                                    //Brick0 m0 : 16|16@1+ (0.0001,0) [0|0] "V"
-                                    //Brick1 m0 : 32|16@1+ (0.0001,0) [0|0] "V"
-                                    //Brick2 m0 : 48|16@1+ (0.0001,0) [0|0] "V"
+      //StatusFlags : 8|8@1+ (1,0) [0|0] ""
+      //Brick0 m0 : 16|16@1+ (0.0001,0) [0|0] "V"
+      //Brick1 m0 : 32|16@1+ (0.0001,0) [0|0] "V"
+      //Brick2 m0 : 48|16@1+ (0.0001,0) [0|0] "V"
       // brick_volts, mux_zero_counter, mux_max are instance member variables (TESLA-BATTERY.h)
       if (rx_frame.data.u8[1] == 0x2A)  // full frame, 3 cell voltages
       {
@@ -2547,7 +2544,6 @@ void TeslaBattery::transmit_can(unsigned long currentMillis) {
   if (currentMillis - previousMillis10 >= INTERVAL_10_MS && transmitPhase == 0) {
     previousMillis10 = currentMillis;
 
-
     if (user_selected_tesla_digital_HVIL) {  //Special Digital HVIL mode for S/X 2024+ batteries
       if ((datalayer.system.status.inverter_allows_contactor_closing) &&
           (datalayer.system.status.system_status != FAULT)) {
@@ -3277,8 +3273,7 @@ void TeslaBattery::on_uds_sequence_step(uint16_t state, uint8_t sid, const uint8
           break;
         }
         const uint8_t* p = &data[8 + k * 4];
-        brick_bleed_time_s[b - 1] =
-            ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+        brick_bleed_time_s[b - 1] = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
       }
       if (end >= start && end < brick_bleed_pack_count) {
         request_bleed_results(end + 1);
@@ -3457,8 +3452,8 @@ void TeslaBattery::on_uds_sequence_timeout(uint16_t state) {
 
 // ---- ECU firmware-version fingerprint ------------------------------------------------------------
 
-static void ver_append_token(char* buf, size_t cap, size_t& pos, const char* key, const char* did,
-                             const uint8_t* bytes, uint8_t n) {
+static void ver_append_token(char* buf, size_t cap, size_t& pos, const char* key, const char* did, const uint8_t* bytes,
+                             uint8_t n) {
   if (n == 0 || pos >= cap) {
     return;
   }
@@ -3598,8 +3593,7 @@ void TeslaBattery::derive_manufacture_date_from_serial() {
   snprintf(yearStr, sizeof(yearStr), "20%c%c", battery_serialNumber[3], battery_serialNumber[4]);
   int year = atoi(yearStr);
   char dayStr[4];
-  snprintf(dayStr, sizeof(dayStr), "%c%c%c", battery_serialNumber[5], battery_serialNumber[6],
-           battery_serialNumber[7]);
+  snprintf(dayStr, sizeof(dayStr), "%c%c%c", battery_serialNumber[5], battery_serialNumber[6], battery_serialNumber[7]);
   int day = atoi(dayStr);
   battery_manufactureDate = dayOfYearToDate(year, day);
 }
@@ -3633,8 +3627,19 @@ void TeslaBattery::send_ecu_reset(uint16_t req_id) {
 // HVC backup engine
 namespace {
 enum HvcScalarTag : uint8_t {
-  TAG_ENERGY, TAG_PACK_INFO, TAG_HIST_COUNT, TAG_ASM_HVBMS, TAG_USE_HVBMS, TAG_CFG_HVBMS,
-  TAG_PKG_PN, TAG_PKG_SN, TAG_BOARD_PN, TAG_BOARD_SN, TAG_ASM_HVP, TAG_USE_HVP, TAG_CFG_HVP,
+  TAG_ENERGY,
+  TAG_PACK_INFO,
+  TAG_HIST_COUNT,
+  TAG_ASM_HVBMS,
+  TAG_USE_HVBMS,
+  TAG_CFG_HVBMS,
+  TAG_PKG_PN,
+  TAG_PKG_SN,
+  TAG_BOARD_PN,
+  TAG_BOARD_SN,
+  TAG_ASM_HVP,
+  TAG_USE_HVP,
+  TAG_CFG_HVP,
   TAG_HVP_CAL,
 };
 // min_len is the shortest response that still decodes without inventing data; shorter positive
@@ -3648,10 +3653,9 @@ struct HvcScalar {
   uint8_t min_len;
 };
 const HvcScalar HVC_SCALARS[] = {
-    {0x0420, TAG_ENERGY, 28},   {0x0450, TAG_PACK_INFO, 10}, {0x0436, TAG_HIST_COUNT, 8},
-    {0xF01C, TAG_ASM_HVBMS, 1}, {0xF01D, TAG_USE_HVBMS, 2},  {0x0439, TAG_CFG_HVBMS, 64},
-    {0xF014, TAG_PKG_PN, 1},    {0xF015, TAG_PKG_SN, 1},     {0xF012, TAG_BOARD_PN, 1},
-    {0xF013, TAG_BOARD_SN, 1},
+    {0x0420, TAG_ENERGY, 28},   {0x0450, TAG_PACK_INFO, 10}, {0x0436, TAG_HIST_COUNT, 8}, {0xF01C, TAG_ASM_HVBMS, 1},
+    {0xF01D, TAG_USE_HVBMS, 2}, {0x0439, TAG_CFG_HVBMS, 64}, {0xF014, TAG_PKG_PN, 1},     {0xF015, TAG_PKG_SN, 1},
+    {0xF012, TAG_BOARD_PN, 1},  {0xF013, TAG_BOARD_SN, 1},
 };
 // Calibration records are read via the CALIBRATION_RECORD routine getResults (HVP 0x438, HVBMS
 // 0x439) with a one-byte record id; the 0x0500+id DIDs are kept as an HVP fallback. HVBMS ids
@@ -3661,10 +3665,9 @@ constexpr uint16_t RT_HVP_CAL = 0x0438;
 constexpr uint16_t RT_HVBMS_CAL = 0x0439;  // routine, distinct from the 0x0439 CONFIGURATION_RECORD DID
 constexpr uint8_t HVBMS_CAL_IDS[TESLA_HVBMS_NUM_CAL] = {0, 1, 6};
 const HvcScalar HVC_SCALARS_HVP[] = {
-    {0xF01C, TAG_ASM_HVP, 1}, {0xF01D, TAG_USE_HVP, 2}, {0x0439, TAG_CFG_HVP, 64},
-    {0x0500, TAG_HVP_CAL, 4}, {0x0501, TAG_HVP_CAL, 4}, {0x0502, TAG_HVP_CAL, 4},
-    {0x0503, TAG_HVP_CAL, 4}, {0x0504, TAG_HVP_CAL, 4}, {0x0505, TAG_HVP_CAL, 4},
-    {0x0506, TAG_HVP_CAL, 4}, {0x0507, TAG_HVP_CAL, 4},
+    {0xF01C, TAG_ASM_HVP, 1}, {0xF01D, TAG_USE_HVP, 2}, {0x0439, TAG_CFG_HVP, 64}, {0x0500, TAG_HVP_CAL, 4},
+    {0x0501, TAG_HVP_CAL, 4}, {0x0502, TAG_HVP_CAL, 4}, {0x0503, TAG_HVP_CAL, 4},  {0x0504, TAG_HVP_CAL, 4},
+    {0x0505, TAG_HVP_CAL, 4}, {0x0506, TAG_HVP_CAL, 4}, {0x0507, TAG_HVP_CAL, 4},
 };
 constexpr uint8_t N_HVC_SCALARS = sizeof(HVC_SCALARS) / sizeof(HVC_SCALARS[0]);
 constexpr uint8_t N_HVC_SCALARS_HVP = sizeof(HVC_SCALARS_HVP) / sizeof(HVC_SCALARS_HVP[0]);
@@ -3736,21 +3739,19 @@ void TeslaBattery::release_hvc_backup_hold() {
 bool TeslaBattery::hvc_send_current() {
   if (hvc_bk_phase == HVC_BK_HVBMS_CAL) {
     uint8_t req[4] = {0x03, (uint8_t)(RT_HVBMS_CAL >> 8), (uint8_t)RT_HVBMS_CAL, HVBMS_CAL_IDS[hvc_bk_step]};
-    return send_sequence_message(TESLA_UDS_HVC_HVBMS_CAL, SID::RoutineControl, req, 4,
-                                 HVC_STEP_TIMEOUT_TICKS, HVC_STEP_RETRIES);
+    return send_sequence_message(TESLA_UDS_HVC_HVBMS_CAL, SID::RoutineControl, req, 4, HVC_STEP_TIMEOUT_TICKS,
+                                 HVC_STEP_RETRIES);
   }
-  const HvcScalar& sc =
-      (hvc_bk_phase == HVC_BK_HVBMS) ? HVC_SCALARS[hvc_bk_step] : HVC_SCALARS_HVP[hvc_bk_step];
+  const HvcScalar& sc = (hvc_bk_phase == HVC_BK_HVBMS) ? HVC_SCALARS[hvc_bk_step] : HVC_SCALARS_HVP[hvc_bk_step];
   if (hvc_bk_phase == HVC_BK_HVP && sc.tag == TAG_HVP_CAL) {
     uint8_t rec = (uint8_t)(sc.did - HVP_CAL_DID_BASE);
     uint8_t req[4] = {0x03, (uint8_t)(RT_HVP_CAL >> 8), (uint8_t)RT_HVP_CAL, rec};
-    return send_sequence_message(TESLA_UDS_HVC_CAL_RT, SID::RoutineControl, req, 4,
-                                 HVC_STEP_TIMEOUT_TICKS, HVC_STEP_RETRIES);
+    return send_sequence_message(TESLA_UDS_HVC_CAL_RT, SID::RoutineControl, req, 4, HVC_STEP_TIMEOUT_TICKS,
+                                 HVC_STEP_RETRIES);
   }
   uint16_t state = (hvc_bk_phase == HVC_BK_HVBMS) ? TESLA_UDS_HVC_HVBMS : TESLA_UDS_HVC_HVP;
   uint8_t req[2] = {(uint8_t)(sc.did >> 8), (uint8_t)sc.did};
-  return send_sequence_message(state, SID::ReadDataByIdentifier, req, 2, HVC_STEP_TIMEOUT_TICKS,
-                               HVC_STEP_RETRIES);
+  return send_sequence_message(state, SID::ReadDataByIdentifier, req, 2, HVC_STEP_TIMEOUT_TICKS, HVC_STEP_RETRIES);
 }
 
 void TeslaBattery::hvc_handle_response(uint16_t state, uint8_t sid, const uint8_t* data, uint16_t len) {
@@ -3777,18 +3778,16 @@ void TeslaBattery::hvc_handle_response(uint16_t state, uint8_t sid, const uint8_
   if (data != nullptr && !negative) {
     stored = hvc_store_scalar(data, len, state == TESLA_UDS_HVC_CAL_RT);
   } else if (negative) {
-    const HvcScalar& sc =
-        (state == TESLA_UDS_HVC_HVBMS) ? HVC_SCALARS[hvc_bk_step] : HVC_SCALARS_HVP[hvc_bk_step];
-    hvc_backup->record_nrc(state == TESLA_UDS_HVC_CAL_RT ? RT_HVP_CAL : sc.did,
-                           len >= 3 ? data[2] : 0);
+    const HvcScalar& sc = (state == TESLA_UDS_HVC_HVBMS) ? HVC_SCALARS[hvc_bk_step] : HVC_SCALARS_HVP[hvc_bk_step];
+    hvc_backup->record_nrc(state == TESLA_UDS_HVC_CAL_RT ? RT_HVP_CAL : sc.did, len >= 3 ? data[2] : 0);
   }
   // An HVP calibration record whose routine read failed gets one more try as the 0x0500+id DID
   // before it is scored - the fallback is a second attempt at the same record, not a separate read.
   if (!stored && state == TESLA_UDS_HVC_CAL_RT) {
     const HvcScalar& sc = HVC_SCALARS_HVP[hvc_bk_step];
     uint8_t req[2] = {(uint8_t)(sc.did >> 8), (uint8_t)sc.did};
-    if (send_sequence_message(TESLA_UDS_HVC_HVP, SID::ReadDataByIdentifier, req, 2,
-                              HVC_STEP_TIMEOUT_TICKS, HVC_STEP_RETRIES)) {
+    if (send_sequence_message(TESLA_UDS_HVC_HVP, SID::ReadDataByIdentifier, req, 2, HVC_STEP_TIMEOUT_TICKS,
+                              HVC_STEP_RETRIES)) {
       return;
     }
   }
@@ -3797,8 +3796,7 @@ void TeslaBattery::hvc_handle_response(uint16_t state, uint8_t sid, const uint8_
 
 bool TeslaBattery::hvc_store_scalar(const uint8_t* rx, uint16_t len, bool via_routine) {
   TeslaHvcBackup& b = *hvc_backup;
-  const HvcScalar& sc =
-      (hvc_bk_phase == HVC_BK_HVBMS) ? HVC_SCALARS[hvc_bk_step] : HVC_SCALARS_HVP[hvc_bk_step];
+  const HvcScalar& sc = (hvc_bk_phase == HVC_BK_HVBMS) ? HVC_SCALARS[hvc_bk_step] : HVC_SCALARS_HVP[hvc_bk_step];
   const uint8_t* data = nullptr;
   uint16_t dlen = 0;
   if (!via_routine && len >= 3 && rx[0] == 0x62) {  // 62 did_hi did_lo <data>
@@ -3984,7 +3982,6 @@ String TeslaBattery::hvc_backup_status_json() {
   return json;
 }
 
-
 void TeslaBattery::setup(void) {  // Performs one time setup at startup
 
   setup_uds(0x602, 0x612);
@@ -4129,8 +4126,9 @@ String build_hvc_backup_json(const TeslaHvcBackup& b) {
   out += "{\n  \"data\": [\n";
 
   // ---- block 0: HVBMS Data table ----
-  out += "    {\n      \"data\": {\n        \"headers\": [\n          \"Name\",\n          \"Data\"\n"
-         "        ],\n        \"rows\": [\n";
+  out +=
+      "    {\n      \"data\": {\n        \"headers\": [\n          \"Name\",\n          \"Data\"\n"
+      "        ],\n        \"rows\": [\n";
   bool first = true;
   const uint8_t* e = b.energy_counters;
   bool ec = b.energy_counters_present;
@@ -4176,12 +4174,14 @@ String build_hvc_backup_json(const TeslaHvcBackup& b) {
   }
   hvc_row(out, first, "Package Part Number", b.package_pn_present ? hvc_q(b.package_pn) : String(MISSING));
   hvc_row(out, first, "Package Serial Number", b.package_sn_present ? hvc_q(b.package_sn) : String(MISSING));
-  out += "\n        ]\n      },\n      \"data_type\": \"Table\",\n      \"name\": \"HVBMS Data\",\n"
-         "      \"units\": null\n    },\n";
+  out +=
+      "\n        ]\n      },\n      \"data_type\": \"Table\",\n      \"name\": \"HVBMS Data\",\n"
+      "      \"units\": null\n    },\n";
 
   // ---- block 1: HVP Data table ----
-  out += "    {\n      \"data\": {\n        \"headers\": [\n          \"Name\",\n          \"Data\"\n"
-         "        ],\n        \"rows\": [\n";
+  out +=
+      "    {\n      \"data\": {\n        \"headers\": [\n          \"Name\",\n          \"Data\"\n"
+      "        ],\n        \"rows\": [\n";
   first = true;
   hvc_row(out, first, "Assembly ID", b.assembly_id_hvp_present ? String(b.assembly_id_hvp) : String(MISSING));
   hvc_row(out, first, "Usage ID", b.usage_id_hvp_present ? String(b.usage_id_hvp) : String(MISSING));
@@ -4203,23 +4203,31 @@ String build_hvc_backup_json(const TeslaHvcBackup& b) {
     hvc_row(out, first, HVP_CAL_NAMES[i], b.hvp_cal_present[i] ? String(b.hvp_cal[i]) : String(MISSING));
   }
   hvc_row(out, first, HVP_CAL_NAMES[0], b.hvp_cal_present[0] ? String(b.hvp_cal[0]) : String(MISSING));
-  out += "\n        ]\n      },\n      \"data_type\": \"Table\",\n      \"name\": \"HVP Data\",\n"
-         "      \"units\": null\n    },\n";
+  out +=
+      "\n        ]\n      },\n      \"data_type\": \"Table\",\n      \"name\": \"HVP Data\",\n"
+      "      \"units\": null\n    },\n";
 
   // ---- blocks 2-4: Readable Time, Board Serial / Part Number ----
   out += "    {\n      \"data\": \"";
   out += (b.readable_time[0] ? b.readable_time : "Not Available");
-  out += "\",\n      \"data_type\": \"<class 'str'>\",\n      \"name\": \"Readable Time\",\n      \"units\": null\n    },\n";
+  out +=
+      "\",\n      \"data_type\": \"<class 'str'>\",\n      \"name\": \"Readable Time\",\n      \"units\": null\n    "
+      "},\n";
   out += "    {\n      \"data\": ";
   out += b.board_sn_present ? hvc_q(b.board_sn) : String(MISSING);
-  out += ",\n      \"data_type\": \"<class 'str'>\",\n      \"name\": \"Board Serial Number\",\n      \"units\": null\n    },\n";
+  out +=
+      ",\n      \"data_type\": \"<class 'str'>\",\n      \"name\": \"Board Serial Number\",\n      \"units\": null\n   "
+      " },\n";
   out += "    {\n      \"data\": ";
   out += b.board_pn_present ? hvc_q(b.board_pn) : String(MISSING);
-  out += ",\n      \"data_type\": \"<class 'str'>\",\n      \"name\": \"Board Part Number\",\n      \"units\": null\n    },\n";
+  out +=
+      ",\n      \"data_type\": \"<class 'str'>\",\n      \"name\": \"Board Part Number\",\n      \"units\": null\n    "
+      "},\n";
 
   // ---- block 5: Pack Info. Brick Group Counts use ODIN's limits: SOC 96, CAC 96, BLEED 48.
   auto groups = [](uint8_t bricks, uint8_t limit) -> uint8_t {
-    if (!bricks || !limit) return 0;
+    if (!bricks || !limit)
+      return 0;
     return (bricks + limit - 1) / limit;
   };
   out += "    {\n      \"data\": {\n";
@@ -4228,18 +4236,24 @@ String build_hvc_backup_json(const TeslaHvcBackup& b) {
          ",\n          \"SOC\": " + String(groups(b.num_bricks, 96)) + "\n        },\n";
   out += "        \"Histogram Page Counts\": {\n";
   for (uint8_t h = 0; h < TESLA_HVC_NUM_HISTOGRAMS; h++) {
-    out += "          \"Histogram ID " + String(h + 1) + "\": " +
-           String(b.hist_page_count_present ? b.hist_page_count[h] : 0);
+    out += "          \"Histogram ID " + String(h + 1) +
+           "\": " + String(b.hist_page_count_present ? b.hist_page_count[h] : 0);
     out += (h < TESLA_HVC_NUM_HISTOGRAMS - 1) ? ",\n" : "\n";
   }
   out += "        },\n";
   out += "        \"Number Of Bricks\": " + String(b.num_bricks) + ",\n";
   out += "        \"Number Of Modules\": " + String(b.num_modules) + "\n";
-  out += "      },\n      \"data_type\": \"<class 'dict'>\",\n      \"name\": \"Pack Info\",\n      \"units\": null\n    },\n";
+  out +=
+      "      },\n      \"data_type\": \"<class 'dict'>\",\n      \"name\": \"Pack Info\",\n      \"units\": null\n    "
+      "},\n";
 
   // ---- blocks 6/7: Recovery Type / Version. PARTIAL tells a restore to recalibrate the skipped data.
-  out += "    {\n      \"data\": \"PARTIAL\",\n      \"data_type\": \"<class 'str'>\",\n      \"name\": \"Recovery Type\",\n      \"units\": null\n    },\n";
-  out += "    {\n      \"data\": \"1.0.1\",\n      \"data_type\": \"<class 'str'>\",\n      \"name\": \"Version\",\n      \"units\": null\n    },\n";
+  out +=
+      "    {\n      \"data\": \"PARTIAL\",\n      \"data_type\": \"<class 'str'>\",\n      \"name\": \"Recovery "
+      "Type\",\n      \"units\": null\n    },\n";
+  out +=
+      "    {\n      \"data\": \"1.0.1\",\n      \"data_type\": \"<class 'str'>\",\n      \"name\": \"Version\",\n      "
+      "\"units\": null\n    },\n";
 
   // ---- blocks 8-10: per-brick statistics, not read by a partial backup ----
   auto missing_block = [&](const char* name) {
@@ -4270,7 +4284,8 @@ String build_hvc_backup_json(const TeslaHvcBackup& b) {
     out += "none";
   } else {
     for (uint8_t i = 0; i < b.nrc_records; i++) {
-      if (i) out += ", ";
+      if (i)
+        out += ", ";
       out += hex4(b.nrc_did[i]) + " NRC " + hex2(b.nrc_code[i]);
     }
   }
@@ -4280,22 +4295,26 @@ String build_hvc_backup_json(const TeslaHvcBackup& b) {
     bool any = false;
     for (uint8_t i = 0; i < TESLA_HVP_NUM_CAL; i++) {
       if (b.hvp_cal_present[i] && b.hvp_cal_from_did[i]) {
-        if (any) out += ", ";
+        if (any)
+          out += ", ";
         out += hex4((uint16_t)(HVP_CAL_DID_BASE + i));
         any = true;
       }
     }
-    if (!any) out += "none";
+    if (!any)
+      out += "none";
   }
   out += "\",\n";
   out += "        \"Short Reads\": " + String(b.short_read_count) + ",\n";
   out += "        \"First Short Read\": \"";
   out += b.short_read_count ? (hex4(b.short_read_did) + " " + String(b.short_read_len) + " bytes") : String("none");
   out += "\"\n";
-  out += "      },\n      \"data_type\": \"<class 'dict'>\",\n      \"name\": \"Read Diagnostics\",\n"
-         "      \"units\": null\n    }\n";
+  out +=
+      "      },\n      \"data_type\": \"<class 'dict'>\",\n      \"name\": \"Read Diagnostics\",\n"
+      "      \"units\": null\n    }\n";
 
-  out += "  ],\n  \"exit_code\": 0,\n  \"exit_reason\": null,\n"
-         "  \"user_facing_msg\": \"Successfully read HVC backup data from Car Computer.\"\n}\n";
+  out +=
+      "  ],\n  \"exit_code\": 0,\n  \"exit_reason\": null,\n"
+      "  \"user_facing_msg\": \"Successfully read HVC backup data from Car Computer.\"\n}\n";
   return out;
 }

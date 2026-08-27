@@ -224,19 +224,19 @@ class TeslaHtmlRenderer : public BatteryHtmlRenderer {
     content += "<h4>PCS Part Number: " + String(readablePCSPartNumber) + "</h4>";
     //Decoded from the serial number. NULL until a serial has been read, so guard it explicitly
     //rather than relying on String's own NULL handling.
-    content += "<h4>Battery Manufacture Date: " +
-               String(datalayer_extended.tesla.battery_manufactureDate
-                          ? datalayer_extended.tesla.battery_manufactureDate
-                          : "") +
-               "</h4>";
+    content +=
+        "<h4>Battery Manufacture Date: " +
+        String(datalayer_extended.tesla.battery_manufactureDate ? datalayer_extended.tesla.battery_manufactureDate
+                                                                : "") +
+        "</h4>";
     //ECU firmware-version fingerprint (DID 0xF180 + 0x0F00/0x0F02): paste into the packid tool
     //(`packid match-fingerprint '<line>'`) to resolve HVBMS/HVP/PCS to an ice software release.
     {
       uint8_t verState = datalayer_extended.tesla.ecu_version_query_state;
       content += "<h4>ECU FW Fingerprint: ";
       if (verState == 2) {
-        content += "<code style='word-break:break-all'>" +
-                   String(datalayer_extended.tesla.ecu_version_fingerprint) + "</code>";
+        content += "<code style='word-break:break-all'>" + String(datalayer_extended.tesla.ecu_version_fingerprint) +
+                   "</code>";
       } else if (verState == 1) {
         content += "querying...";
       } else {
@@ -305,19 +305,17 @@ class TeslaHtmlRenderer : public BatteryHtmlRenderer {
     }
     //Experimental balancing status
     if (datalayer_extended.tesla.BMS_balanceStateUnknown) {
-      content += "<h4>Balancing: Unknown state " + String(datalayer_extended.tesla.BMS_balanceState) +
-                 " reported</h4>";
+      content += "<h4>Balancing: Unknown state " + String(datalayer_extended.tesla.BMS_balanceState) + " reported</h4>";
     } else if (datalayer_extended.tesla.BMS_vshTestActive) {
-      content +=
-          "<h4>Balancing: Voltage Sense Harness (VSH) test running</h4>";
+      content += "<h4>Balancing: Voltage Sense Harness (VSH) test running</h4>";
     } else if (datalayer.battery.status.balancing_status == BALANCING_STATUS_ACTIVE) {
       content += "<h4>Balancing: Active for " + String(datalayer_extended.tesla.BMS_balanceTimeThisCycle_s) +
                  " s this cycle</h4>";
     } else {
       content += "<h4>Balancing: Not active</h4>";
     }
-    content += "<h4>Balancing Total (since last BMS reset/power cycle): " + String(datalayer_extended.tesla.BMS_cumulativeBleedTime_s) +
-               " s</h4>";
+    content += "<h4>Balancing Total (since last BMS reset/power cycle): " +
+               String(datalayer_extended.tesla.BMS_cumulativeBleedTime_s) + " s</h4>";
     if (datalayer_extended.tesla.BMS_brickBleedValid) {
       content += "<h4>Bricks Bleeding Now: " + String(datalayer_extended.tesla.BMS_brickBleedActiveCount) + " of " +
                  String(datalayer_extended.tesla.BMS_brickCount) + "</h4>";
@@ -328,8 +326,9 @@ class TeslaHtmlRenderer : public BatteryHtmlRenderer {
     content += "<h4>BMS HV State: " + String(BMS_hvState[datalayer_extended.tesla.BMS_hvState]) + "</h4>";
     content += "<h4>BMS UI Charge Status: " + String(BMS_uiChargeStatus[datalayer_extended.tesla.BMS_uiChargeStatus]) +
                "</h4>";
-    content += "<h4>CAC Estimation Source: " + String(BMS_cacSource[datalayer_extended.tesla.BMS_cacEstimationSource & 0x03]) +
-               "</h4>";
+    content +=
+        "<h4>CAC Estimation Source: " + String(BMS_cacSource[datalayer_extended.tesla.BMS_cacEstimationSource & 0x03]) +
+        "</h4>";
     content += "<h4>Vehicle State: " + String(vehicleStateText[datalayer_extended.tesla.vehicleState & 0x03]) +
                (datalayer_extended.tesla.balance_at_rest_enabled ? " (Balance At Rest: ON)" : "") + "</h4>";
     content += "<h4>BMS_buildConfigId: " + String(datalayer_extended.tesla.BMS_info_buildConfigId) + "</h4>";

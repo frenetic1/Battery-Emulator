@@ -21,12 +21,12 @@ static String hvc_backup_status_html(int ix) {
   content += "var url = '/hvc_backup.json?battery=" + n + "';";
   content += "var baseRun = -1;";
   content += "function draw(s) {";
-  content += "  if (s.state == 'running') { el.innerHTML = 'Reading backup: ' + s.phase + ' (' + s.reads + ' reads)'; }";
+  content +=
+      "  if (s.state == 'running') { el.innerHTML = 'Reading backup: ' + s.phase + ' (' + s.reads + ' reads)'; }";
   content +=
       "  else if (s.state == 'ready') { el.innerHTML = 'Backup ready (' + s.ok + '/' + s.reads + ' reads answered)'"
       " + (s.note ? \"<br><span style='color: #FC6;'>\" + s.note + '</span>' : ''); }";
-  content +=
-      "  else if (s.state == 'refused') { el.innerHTML = 'Backup refused: ' + s.phase + '.'; }";
+  content += "  else if (s.state == 'refused') { el.innerHTML = 'Backup refused: ' + s.phase + '.'; }";
   content += "  else { el.innerHTML = ''; }";
   // Download when the completed-run counter advances past what this page saw first. Watching for a
   // running->ready transition missed fast runs entirely (a partial read finishes between two
@@ -109,8 +109,7 @@ std::vector<BatteryCommand> battery_commands = {
     {"balanceAtRest", "Toggle Balance At Rest (experimental)",
      "toggle experimental auto mode: switches DRIVE/ACCESSORY by load so the pack can balance at "
      "rest?",
-     [](Battery* b) { return b && b->supports_set_vehicle_mode(); },
-     [](Battery* b) { b->toggle_balance_at_rest(); }},
+     [](Battery* b) { return b && b->supports_set_vehicle_mode(); }, [](Battery* b) { b->toggle_balance_at_rest(); }},
     {"resetCrash", "Unlock crashed BMS",
      "reset crash data? Note this will unlock your BMS and enable contactor closing and SOC calculation.",
      [](Battery* b) { return b && b->supports_reset_crash(); }, [](Battery* b) { b->reset_crash(); }},

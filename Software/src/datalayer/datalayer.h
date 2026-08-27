@@ -226,8 +226,8 @@ struct DATALAYER_BATTERY_SETTINGS_TYPE {
   bool user_requests_balancing = false;
   bool user_requests_tesla_isolation_clear = false;
   bool user_requests_tesla_bms_reset = false;
-  bool user_requests_tesla_hvp_reset = false;  // UDS ECUReset (0x11 0x01) to the HVP/HVC (0x610)
-  bool user_requests_tesla_pcs_reset = false;  // UDS ECUReset (0x11 0x01) to the PCS (0x628)
+  bool user_requests_tesla_hvp_reset = false;           // UDS ECUReset (0x11 0x01) to the HVP/HVC (0x610)
+  bool user_requests_tesla_pcs_reset = false;           // UDS ECUReset (0x11 0x01) to the PCS (0x628)
   bool user_requests_tesla_hvc_backup_partial = false;  // HVC backup (required-for-recovery fields)
   bool user_requests_tesla_soc_reset = false;
   bool user_requests_tesla_cac_reset = false;
