@@ -405,7 +405,7 @@ class TeslaBattery : public UdsCanBattery {
       4250;  //Battery is put into emergency stop if one cell goes over this value
   static const int MIN_CELL_VOLTAGE_NCA_NCM =
       2950;                                      //Battery is put into emergency stop if one cell goes below this value
-  static const int MAX_CELL_VOLTAGE_LFP = 3650;  //Battery is put into emergency stop if one cell goes over this value
+  static const int MAX_CELL_VOLTAGE_LFP = 3600;  //Battery is put into emergency stop if one cell goes over this value
   static const int MIN_CELL_VOLTAGE_LFP = 2800;  //Battery is put into emergency stop if one cell goes below this value
 
   DATALAYER_BATTERY_TYPE* datalayer_battery;
@@ -443,7 +443,7 @@ class TeslaBattery : public UdsCanBattery {
   //0x221 VCFRONT_LVPowerState
   uint8_t alternateMux = 1;
   uint8_t frameCounter_TESLA_221 = 15;   // Start at 15 for Mux 0
-  uint8_t vehicleState = 1;              // "OFF": 0, "DRIVE": 1, "ACCESSORY": 2, "GOING_DOWN": 3
+  uint8_t vehicleState = 0;              // "OFF": 0, "DRIVE": 1, "ACCESSORY": 2, "GOING_DOWN": 3
   bool accessory_mode_forced = false;    // vehicleState = ACCESSORY (set by button or auto), otherwise DRIVE
   bool power_zeroed = false;             // ACCESSORY button zeroes charge/discharge; DRIVE button clears it
   bool balance_at_rest_enabled = false;  // experimental: auto DRIVE/ACCESSORY by load so the pack can balance at rest
@@ -454,7 +454,23 @@ class TeslaBattery : public UdsCanBattery {
   static const uint8_t CAR_DRIVE = 1;
   static const uint8_t ACCESSORY = 2;
   static const uint8_t GOING_DOWN = 3;
-  uint8_t powerDownSeconds = 9;  // Car power down (i.e. contactor open) tracking timer, 3 seconds per sendingState
+  //LFP packs need the car's real DRIVE->ACCESSORY handshake on 0x221 (every LV consumer walks ON -> GOING_DOWN -> OFF
+  //over ~2.2 s) plus a matching 0x2E1 VEHICLE_STATE frame. It always runs to completion once started, even if
+  //DRIVE is requested again meanwhile; the requested vehicleState is only acted on when it has finished.
+  static const uint8_t LFP_ACC_TRANSITION = 4;         //internal "send state", never stored in vehicleState
+  static const uint8_t LFP_ACC_TRANSITION_PAIRS = 22;  //Mux0+Mux1 pairs (100ms each) in the transition
+  bool lfp_acc_transition_active = false;
+  bool lfp_left_drive =
+      false;  //set when a DRIVE -> non-DRIVE sequence starts, cleared on DRIVE; keeps 0x118 silent in OFF
+  uint8_t lfp_acc_transition_slot = 0;  //0.. (2 * pairs - 1), one per 50ms 0x221 frame
+  uint8_t last_sent_vehicle_state = 0;  //state the 0x221 frames last represented (0 = OFF)
+  bool is_lfp_pack() const;
+  bool lfp_di_silent() const;
+  void update_118_lfp_state();
+  uint8_t resolve_221_send_state();
+  void transmit_221_lfp(uint8_t sendState);
+  void update_2E1_vehicle_state();
+  uint8_t powerDownSeconds = 3;  // Car power down (i.e. contactor open) tracking timer, 3 seconds per sendingState
   //0x2E1 VCFRONT_status, 6 mux tracker
   uint8_t muxNumber_TESLA_2E1 = 5;
   //0x334 UI
@@ -590,6 +606,31 @@ class TeslaBattery : public UdsCanBattery {
                                   .ID = 0x221,
                                   .data = {0x01, 0x01, 0x01, 0x50, 0x00, 0x00, 0x00, 0x76}};
 
+  //0x221 LFP working frames for ACCESSORY and the DRIVE->ACCESSORY transition (payload filled in transmit_221_lfp)
+  CAN_frame TESLA_221_LFP_Mux0 = {.FD = false,
+                                  .ext_ID = false,
+                                  .DLC = 8,
+                                  .ID = 0x221,
+                                  .data = {0x40, 0x41, 0x85, 0x05, 0x00, 0x50, 0xF1, 0x00}};
+  CAN_frame TESLA_221_LFP_Mux1 = {.FD = false,
+                                  .ext_ID = false,
+                                  .DLC = 8,
+                                  .ID = 0x221,
+                                  .data = {0x41, 0x01, 0x55, 0x01, 0x00, 0x00, 0x00, 0x00}};
+
+  //0x221 LFP GOING_DOWN. Same as the generic GOING_DOWN frame, but nothing that is already OFF in the LFP
+  //ACCESSORY frames (esp, radc, tpms, di, dis, oilPump front/rear, epas) is switched back on or to GOING_DOWN.
+  CAN_frame TESLA_221_LFP_GOING_DOWN_Mux0 = {.FD = false,
+                                             .ext_ID = false,
+                                             .DLC = 8,
+                                             .ID = 0x221,
+                                             .data = {0x00, 0x81, 0x85, 0x06, 0x00, 0x50, 0xF1, 0x00}};
+  CAN_frame TESLA_221_LFP_GOING_DOWN_Mux1 = {.FD = false,
+                                             .ext_ID = false,
+                                             .DLC = 8,
+                                             .ID = 0x221,
+                                             .data = {0x01, 0x01, 0x55, 0x59, 0x00, 0x00, 0x00, 0x00}};
+
   //0x229 SCCM_rightStalk: "cycle_time" 100ms, SCCM_rightStalkChecksum/SCCM_rightStalkCounter generated via dedicated generateTESLA_229 function for now
   //CRC seemingly related to AUTOSAR ID array... "autosarDataIds": [124,182,240,47,105,163,221,28,86,144,202,9,67,125,183,241] found in Model 3 firmware
   CAN_frame TESLA_229 = {.FD = false, .ext_ID = false, .DLC = 3, .ID = 0x229, .data = {0x46, 0x00, 0x00}};
@@ -607,11 +648,13 @@ class TeslaBattery : public UdsCanBattery {
 
   //0x2E1, 6 muxes
   //0x2E1 VCFRONT_status: "cycle_time" 10ms each mux/statusIndex
-  static constexpr CAN_frame TESLA_2E1_VEHICLE_AND_RAILS = {.FD = false,
-                                                            .ext_ID = false,
-                                                            .DLC = 8,
-                                                            .ID = 0x2E1,
-                                                            .data = {0x29, 0x0A, 0x00, 0xFF, 0x0F, 0x00, 0x00, 0x00}};
+  //statusIndex 1 (VCFRONT_STS_IDX_VEHICLE_STATE): byte0 bit4 epasWakeLine, byte1 vehicleStatusDBG (13 DRIVE,
+  //9 HV_UP_STANDBY, 10 ACCESSORY). Mutable: LFP packs get it set from the 0x221 state in update_2E1_vehicle_state().
+  CAN_frame TESLA_2E1_VEHICLE_AND_RAILS = {.FD = false,
+                                           .ext_ID = false,
+                                           .DLC = 8,
+                                           .ID = 0x2E1,
+                                           .data = {0x29, 0x0A, 0x00, 0xFF, 0x0F, 0x00, 0x00, 0x00}};
 
   //{0x29, 0x0A, 0x00, 0xFF, 0x0F, 0x00, 0x00, 0x00} INIT
   //{0x29, 0x0A, 0x0D, 0xFF, 0x0F, 0x00, 0x00, 0x00} DRIVE

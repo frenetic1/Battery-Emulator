@@ -2515,6 +2515,169 @@ void TeslaBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
   }
 }
 
+bool TeslaBattery::is_lfp_pack() const {
+  return datalayer_battery->info.chemistry == battery_chemistry_enum::LFP;
+}
+
+// Decides what the next 0x221 frame represents. On LFP packs a DRIVE -> non-DRIVE change is turned into the
+// DRIVE->ACCESSORY transition, started on a Mux0 slot so the Mux0/Mux1 pairs stay aligned. Once started it is
+// always played to the end, whatever vehicleState becomes meanwhile (e.g. DRIVE is pressed again): the request is
+// acted on afterwards, so the BMS never sees a half-finished or interleaved handshake.
+uint8_t TeslaBattery::resolve_221_send_state() {
+  if (!is_lfp_pack()) {
+    lfp_acc_transition_active = false;
+    return vehicleState;
+  }
+  if (!lfp_acc_transition_active && last_sent_vehicle_state == CAR_DRIVE && vehicleState != CAR_DRIVE) {
+    if (!alternateMux) {
+      return CAR_DRIVE;  // Mux1 slot: keep sending DRIVE until the next Mux0 slot
+    }
+    lfp_acc_transition_active = true;
+    lfp_acc_transition_slot = 0;
+    lfp_left_drive = true;
+  }
+  if (lfp_acc_transition_active) {
+    return LFP_ACC_TRANSITION;
+  }
+  return vehicleState;
+}
+
+// LFP: the car's DI_systemStatus (0x118, and DI_torque 0x1D8) is silent in ACCESSORY. In the capture it stops
+// at the start of the last transition pair (just before di is OFF in 0x221) and resumes ~0.17 s after the
+// 0x221 DRIVE frames return. It stays silent for the rest of the shutdown (GOING_DOWN, OFF) as well. Boot, and
+// OFF before DRIVE has ever been left, keep sending 0x118 as before.
+bool TeslaBattery::lfp_di_silent() const {
+  if (!is_lfp_pack()) {
+    return false;
+  }
+  if (lfp_acc_transition_active) {
+    return (lfp_acc_transition_slot / 2) >= (LFP_ACC_TRANSITION_PAIRS - 1);
+  }
+  if (last_sent_vehicle_state == ACCESSORY || last_sent_vehicle_state == GOING_DOWN) {
+    return true;
+  }
+  return last_sent_vehicle_state == CAR_OFF && lfp_left_drive;
+}
+
+// LFP: while 0x221 walks to ACCESSORY the car's DI winds down its own state first, then goes silent:
+//   STANDBY/P (b2 0x32) -> IDLE, gear SNA (F1, b1 high nibble 6 then 8) after ~50ms -> UNAVAILABLE, gear SNA (F0)
+//   after ~0.2 s. We keep our usual 0x2A STANDBY/P otherwise. Byte 1 high nibble = driveBlocked/spare bits.
+// The frame is edited in place, so the checksum is recomputed for the current counter; the regular
+// generateFrameCounterChecksum() at the end of the 10ms block then carries on from there.
+void TeslaBattery::update_118_lfp_state() {
+  if (!is_lfp_pack()) {
+    return;
+  }
+  uint8_t hi = 0x6, b2 = 0x2A;
+  if (lfp_acc_transition_active) {
+    const uint8_t slot = lfp_acc_transition_slot;  // 50ms 0x221 frames sent so far
+    if (slot <= 1) {
+      b2 = 0xF1;
+    } else if (slot <= 3) {
+      b2 = 0xF1;
+      hi = 0x8;
+    } else {
+      b2 = 0xF0;
+      hi = 0x8;
+    }
+  }
+  const uint8_t counter = TESLA_118.data.u8[1] & 0x0F;
+  TESLA_118.data.u8[1] = uint8_t((hi << 4) | counter);
+  TESLA_118.data.u8[2] = b2;
+  generateMuxFrameCounterChecksum(TESLA_118, counter, 8, 4, 0, 8);
+}
+
+// LFP: steady ACCESSORY and the DRIVE->ACCESSORY transition, as captured from a real LFP car.
+// 0x221 byte0 bits5-6 = vehiclePowerState (2 = ACCESSORY); the other fields are 2-bit LV states
+// (0 OFF, 1 ON, 2 GOING_DOWN, in the order they appear in the bytes):
+//   Mux0 byte1: park esp radc hvacComp | byte2: ptc sccm tpms rcm | byte3: iBooster tuner amp das1
+//        byte4: das2 di dis oilPumpFront | byte5: oilPumpRear ocs vcLeft vcRight
+//   Mux1 byte1: cp epas hvc tas | byte3: pcs ...
+// One table entry per 100ms (a Mux0 + Mux1 pair).
+void TeslaBattery::transmit_221_lfp(uint8_t sendState) {
+  struct Mux0Step {
+    uint8_t b1, b2, b4, b5;
+  };
+  static const Mux0Step steady = {0x41, 0x85, 0x00, 0x50};
+  // Mux0 payload per 100ms pair index (0 .. LFP_ACC_TRANSITION_PAIRS - 1)
+  static const Mux0Step step0 = {0x69, 0x55, 0xA4, 0x51};   // esp, radc, dis, oilF -> GOING_DOWN
+  static const Mux0Step step1 = {0x69, 0xA5, 0xA4, 0x51};   // + tpms, rcm
+  static const Mux0Step step2 = {0x69, 0xA5, 0xA8, 0x52};   // + di, oilR (pairs 2-3)
+  static const Mux0Step step4 = {0x49, 0xA5, 0xA8, 0x52};   // radc -> OFF, held ~1.6 s (pairs 4-19)
+  static const Mux0Step step20 = {0x41, 0xA5, 0x08, 0x52};  // esp, dis, oilF -> OFF
+  static const Mux0Step step21 = {0x41, 0x85, 0x08, 0x52};  // tpms -> OFF, then steady (di, oilR -> OFF)
+
+  const bool transition = (sendState == LFP_ACC_TRANSITION);
+  const uint8_t pair = lfp_acc_transition_slot / 2;
+  CAN_frame& f = alternateMux ? TESLA_221_LFP_Mux0 : TESLA_221_LFP_Mux1;
+  if (alternateMux) {
+    const Mux0Step* st = &steady;
+    if (transition) {
+      if (pair == 0) {
+        st = &step0;
+      } else if (pair == 1) {
+        st = &step1;
+      } else if (pair < 4) {
+        st = &step2;
+      } else if (pair < 20) {
+        st = &step4;
+      } else if (pair == 20) {
+        st = &step20;
+      } else {
+        st = &step21;
+      }
+    }
+    f.data.u8[1] = st->b1;
+    f.data.u8[2] = st->b2;
+    f.data.u8[4] = st->b4;
+    f.data.u8[5] = st->b5;
+  } else {
+    // epas (and the Mux1 consumers' request bits) stay GOING_DOWN until the pairs are done
+    const bool epas_going_down = transition && pair < LFP_ACC_TRANSITION_PAIRS - 2;
+    f.data.u8[1] = epas_going_down ? 0x09 : 0x01;
+    f.data.u8[3] = epas_going_down ? 0x09 : 0x01;
+  }
+  generateMuxFrameCounterChecksum(f, frameCounter_TESLA_221, 52, 4, 56, 8);
+  transmit_can_frame(&f);
+
+  if (transition && ++lfp_acc_transition_slot >= 2 * LFP_ACC_TRANSITION_PAIRS) {
+    lfp_acc_transition_active = false;
+    lfp_acc_transition_slot = 0;
+    last_sent_vehicle_state = ACCESSORY;
+  }
+}
+
+// LFP: 0x2E1 VEHICLE_STATE follows the state announced on 0x221, as the car does:
+// DRIVE 39 0D, then HV_UP_STANDBY 39 09 (just before the first transitional 0x221), ACCESSORY 39 0A, and
+// finally 29 0A (EPAS wake line dropped). Seen identically in all 21 captured drive->accessory switches.
+// Other packs keep the fixed frame.
+void TeslaBattery::update_2E1_vehicle_state() {
+  if (!is_lfp_pack()) {
+    return;
+  }
+  uint8_t b0 = 0x29, b1 = 0x0A, b5 = 0x09;
+  // The car announces HV_UP_STANDBY -> ACCESSORY ~50ms before its first transitional 0x221 frame, then
+  // drops the EPAS wake line, so lead the transition by one 0x2E1 frame while it is still pending.
+  const bool transition_pending =
+      !lfp_acc_transition_active && last_sent_vehicle_state == CAR_DRIVE && vehicleState != CAR_DRIVE;
+  if (transition_pending) {
+    b0 = 0x39;
+    b1 = 0x09;
+  } else if (lfp_acc_transition_active) {
+    if (lfp_acc_transition_slot / 2 == 0) {
+      b0 = 0x39;
+    }
+  } else if (last_sent_vehicle_state == CAR_DRIVE) {
+    b0 = 0x39;
+    b1 = 0x0D;
+    b5 = 0x29;
+  }
+  TESLA_2E1_VEHICLE_AND_RAILS.data.u8[0] = b0;
+  TESLA_2E1_VEHICLE_AND_RAILS.data.u8[1] = b1;
+  TESLA_2E1_VEHICLE_AND_RAILS.data.u8[4] = 0x1F;
+  TESLA_2E1_VEHICLE_AND_RAILS.data.u8[5] = b5;
+}
+
 void TeslaBattery::transmit_can(unsigned long currentMillis) {
   transmit_uds_can(currentMillis);
 
@@ -2557,8 +2720,12 @@ void TeslaBattery::transmit_can(unsigned long currentMillis) {
         index_118 = (index_118 + 1) % 16;
       }
     } else {  //Normal handling of 118 message (Non digital HVIL version)
-      //0x118 DI_systemStatus
-      transmit_can_frame(&TESLA_118);
+      //0x118 DI_systemStatus. On LFP the car stops sending it once the drive inverter request (0x221 di) is
+      //dropping out in ACCESSORY, and the emulator follows suit.
+      if (!lfp_di_silent()) {
+        update_118_lfp_state();
+        transmit_can_frame(&TESLA_118);
+      }
       index_1CF = 0;  //Stop broadcasting Digital HVIL 1CF and 118 to keep contactors open
       index_118 = 0;
     }
@@ -2566,6 +2733,7 @@ void TeslaBattery::transmit_can(unsigned long currentMillis) {
     //0x2E1 VCFRONT_status
     switch (muxNumber_TESLA_2E1) {
       case 0:
+        update_2E1_vehicle_state();
         transmit_can_frame(&TESLA_2E1_VEHICLE_AND_RAILS);
         break;
       case 1:
@@ -2596,7 +2764,8 @@ void TeslaBattery::transmit_can(unsigned long currentMillis) {
     previousMillis50 = currentMillis;
 
     //0x221 VCFRONT_LVPowerState
-    if (vehicleState == CAR_DRIVE) {
+    const uint8_t sendState221 = resolve_221_send_state();
+    if (sendState221 == CAR_DRIVE) {
       if (alternateMux) {
         generateMuxFrameCounterChecksum(TESLA_221_DRIVE_Mux0, frameCounter_TESLA_221, 52, 4, 56, 8);
         transmit_can_frame(&TESLA_221_DRIVE_Mux0);
@@ -2604,7 +2773,9 @@ void TeslaBattery::transmit_can(unsigned long currentMillis) {
         generateMuxFrameCounterChecksum(TESLA_221_DRIVE_Mux1, frameCounter_TESLA_221, 52, 4, 56, 8);
         transmit_can_frame(&TESLA_221_DRIVE_Mux1);
       }
-    } else if (vehicleState == ACCESSORY) {
+    } else if (sendState221 == LFP_ACC_TRANSITION || (sendState221 == ACCESSORY && is_lfp_pack())) {
+      transmit_221_lfp(sendState221);
+    } else if (sendState221 == ACCESSORY) {
       if (alternateMux) {
         generateMuxFrameCounterChecksum(TESLA_221_ACCESSORY_Mux0, frameCounter_TESLA_221, 52, 4, 56, 8);
         transmit_can_frame(&TESLA_221_ACCESSORY_Mux0);
@@ -2612,15 +2783,13 @@ void TeslaBattery::transmit_can(unsigned long currentMillis) {
         generateMuxFrameCounterChecksum(TESLA_221_ACCESSORY_Mux1, frameCounter_TESLA_221, 52, 4, 56, 8);
         transmit_can_frame(&TESLA_221_ACCESSORY_Mux1);
       }
-    } else if (vehicleState == GOING_DOWN) {
-      if (alternateMux) {
-        generateMuxFrameCounterChecksum(TESLA_221_GOING_DOWN_Mux0, frameCounter_TESLA_221, 52, 4, 56, 8);
-        transmit_can_frame(&TESLA_221_GOING_DOWN_Mux0);
-      } else {
-        generateMuxFrameCounterChecksum(TESLA_221_GOING_DOWN_Mux1, frameCounter_TESLA_221, 52, 4, 56, 8);
-        transmit_can_frame(&TESLA_221_GOING_DOWN_Mux1);
-      }
-    } else if (vehicleState == CAR_OFF) {
+    } else if (sendState221 == GOING_DOWN) {
+      const bool lfp = is_lfp_pack();
+      CAN_frame& gd = alternateMux ? (lfp ? TESLA_221_LFP_GOING_DOWN_Mux0 : TESLA_221_GOING_DOWN_Mux0)
+                                   : (lfp ? TESLA_221_LFP_GOING_DOWN_Mux1 : TESLA_221_GOING_DOWN_Mux1);
+      generateMuxFrameCounterChecksum(gd, frameCounter_TESLA_221, 52, 4, 56, 8);
+      transmit_can_frame(&gd);
+    } else if (sendState221 == CAR_OFF) {
       if (alternateMux) {
         generateMuxFrameCounterChecksum(TESLA_221_OFF_Mux0, frameCounter_TESLA_221, 52, 4, 56, 8);
         transmit_can_frame(&TESLA_221_OFF_Mux0);
@@ -2628,6 +2797,12 @@ void TeslaBattery::transmit_can(unsigned long currentMillis) {
         generateMuxFrameCounterChecksum(TESLA_221_OFF_Mux1, frameCounter_TESLA_221, 52, 4, 56, 8);
         transmit_can_frame(&TESLA_221_OFF_Mux1);
       }
+    }
+    if (sendState221 == CAR_DRIVE) {
+      lfp_left_drive = false;
+    }
+    if (sendState221 != LFP_ACC_TRANSITION) {
+      last_sent_vehicle_state = sendState221;
     }
 
     alternateMux ^= 1;  // Flips between 0 and 1. Used to Flip between sending Mux0 and Mux1 on each pass
